@@ -69,9 +69,14 @@ func doService(configPath *string, configTest *bool, build string, serviceFlag *
 		}
 	}
 
+	displayName := "Nebula Network Service"
+	if *serviceName != "Nebula" {
+		displayName += " (" + *serviceName + ")"
+	}
+
 	svcConfig := &service.Config{
 		Name:        *serviceName,
-		DisplayName: "Nebula Network Service",
+		DisplayName: displayName,
 		Description: "Nebula network connectivity daemon for encrypted communications",
 		Arguments:   []string{"-service", "run", "-config", *configPath},
 	}

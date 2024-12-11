@@ -57,7 +57,7 @@ func fileExists(filename string) bool {
 	return true
 }
 
-func doService(configPath *string, configTest *bool, build string, serviceFlag *string) {
+func doService(configPath *string, configTest *bool, build string, serviceFlag *string, serviceName *string) {
 	if *configPath == "" {
 		ex, err := os.Executable()
 		if err != nil {
@@ -70,7 +70,7 @@ func doService(configPath *string, configTest *bool, build string, serviceFlag *
 	}
 
 	svcConfig := &service.Config{
-		Name:        "Nebula",
+		Name:        *serviceName,
 		DisplayName: "Nebula Network Service",
 		Description: "Nebula network connectivity daemon for encrypted communications",
 		Arguments:   []string{"-service", "run", "-config", *configPath},

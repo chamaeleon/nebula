@@ -21,6 +21,7 @@ var Build string
 func main() {
 	serviceFlag := flag.String("service", "", "Control the system service.")
 	configPath := flag.String("config", "", "Path to either a file or directory to load configuration from")
+	serviceName := flag.String("name", "Nebula", "Service name when registering a Windows service.")
 	configTest := flag.Bool("test", false, "Test the config and print the end result. Non zero exit indicates a faulty config")
 	printVersion := flag.Bool("version", false, "Print version")
 	printUsage := flag.Bool("help", false, "Print command line usage")
@@ -38,7 +39,7 @@ func main() {
 	}
 
 	if *serviceFlag != "" {
-		doService(configPath, configTest, Build, serviceFlag)
+		doService(configPath, configTest, Build, serviceFlag, serviceName)
 		os.Exit(1)
 	}
 

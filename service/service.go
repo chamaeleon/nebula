@@ -9,13 +9,10 @@ import (
 	"math"
 	"net"
 	"net/netip"
-	"os"
 	"strings"
 	"sync"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula"
-	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/overlay"
 	"golang.org/x/sync/errgroup"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -46,14 +43,7 @@ type Service struct {
 	}
 }
 
-func New(config *config.C) (*Service, error) {
-	logger := logrus.New()
-	logger.Out = os.Stdout
-
-	control, err := nebula.Main(config, false, "custom-app", logger, overlay.NewUserDeviceFromConfig)
-	if err != nil {
-		return nil, err
-	}
+func New(control *nebula.Control) (*Service, error) {
 	control.Start()
 
 	ctx := control.Context()
@@ -90,9 +80,9 @@ func New(config *config.C) (*Service, error) {
 		},
 	})
 
-	ipNet := device.Cidr()
+	ipNet := device.Networks()
 	pa := tcpip.ProtocolAddress{
-		AddressWithPrefix: tcpip.AddrFromSlice(ipNet.Addr().AsSlice()).WithPrefix(),
+		AddressWithPrefix: tcpip.AddrFromSlice(ipNet[0].Addr().AsSlice()).WithPrefix(),
 		Protocol:          ipv4.ProtocolNumber,
 	}
 	if err := s.ipstack.AddProtocolAddress(nicID, pa, stack.AddressProperties{

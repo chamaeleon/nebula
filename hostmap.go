@@ -1,9 +1,12 @@
 package nebula
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,12 +19,10 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-// const ProbeLen = 100
 const defaultPromoteEvery = 1000       // Count of packets sent before we try moving a tunnel to a preferred underlay ip address
 const defaultReQueryEvery = 5000       // Count of packets sent before re-querying a hostinfo to the lighthouse
 const defaultReQueryWait = time.Minute // Minimum amount of seconds to wait before re-querying a hostinfo the lighthouse. Evaluated every ReQueryEvery
 const MaxRemotes = 10
-const maxRecvError = 4
 
 // MaxHostInfosPerVpnIp is the max number of hostinfos we will track for a given vpn ip
 // 5 allows for an initial handshake and each host pair re-handshaking twice
@@ -68,7 +69,7 @@ type HostMap struct {
 type RelayState struct {
 	sync.RWMutex
 
-	relays map[netip.Addr]struct{} // Set of vpnAddr's of Hosts to use as relays to access this peer
+	relays []netip.Addr // Ordered set of VpnAddrs of Hosts to use as relays to access this peer
 	// For data race avoidance, the contents of a *Relay are treated immutably. To update a *Relay, copy the existing data,
 	// modify what needs to be updated, and store the new modified copy in the relayForByIp and relayForByIdx maps (with
 	// the RelayState Lock held)
@@ -79,7 +80,12 @@ type RelayState struct {
 func (rs *RelayState) DeleteRelay(ip netip.Addr) {
 	rs.Lock()
 	defer rs.Unlock()
-	delete(rs.relays, ip)
+	for idx, val := range rs.relays {
+		if val == ip {
+			rs.relays = append(rs.relays[:idx], rs.relays[idx+1:]...)
+			return
+		}
+	}
 }
 
 func (rs *RelayState) UpdateRelayForByIpState(vpnIp netip.Addr, state int) {
@@ -124,16 +130,16 @@ func (rs *RelayState) GetRelayForByAddr(addr netip.Addr) (*Relay, bool) {
 func (rs *RelayState) InsertRelayTo(ip netip.Addr) {
 	rs.Lock()
 	defer rs.Unlock()
-	rs.relays[ip] = struct{}{}
+	if !slices.Contains(rs.relays, ip) {
+		rs.relays = append(rs.relays, ip)
+	}
 }
 
 func (rs *RelayState) CopyRelayIps() []netip.Addr {
+	ret := make([]netip.Addr, len(rs.relays))
 	rs.RLock()
 	defer rs.RUnlock()
-	ret := make([]netip.Addr, 0, len(rs.relays))
-	for ip := range rs.relays {
-		ret = append(ret, ip)
-	}
+	copy(ret, rs.relays)
 	return ret
 }
 
@@ -208,6 +214,18 @@ func (rs *RelayState) InsertRelay(ip netip.Addr, idx uint32, r *Relay) {
 	rs.relayForByIdx[idx] = r
 }
 
+type NetworkType uint8
+
+const (
+	NetworkTypeUnknown NetworkType = iota
+	// NetworkTypeVPN is a network that overlaps one or more of the vpnNetworks in our certificate
+	NetworkTypeVPN
+	// NetworkTypeVPNPeer is a network that does not overlap one of our networks
+	NetworkTypeVPNPeer
+	// NetworkTypeUnsafe is a network from Certificate.UnsafeNetworks()
+	NetworkTypeUnsafe
+)
+
 type HostInfo struct {
 	remote          netip.AddrPort
 	remotes         *RemoteList
@@ -219,11 +237,10 @@ type HostInfo struct {
 	// vpnAddrs is a list of vpn addresses assigned to this host that are within our own vpn networks
 	// The host may have other vpn addresses that are outside our
 	// vpn networks but were removed because they are not usable
-	vpnAddrs  []netip.Addr
-	recvError atomic.Uint32
+	vpnAddrs []netip.Addr
 
-	// networks are both all vpn and unsafe networks assigned to this host
-	networks   *bart.Lite
+	// networks is a combination of specific vpn addresses (not prefixes!) and full unsafe networks assigned to this host.
+	networks   *bart.Table[NetworkType]
 	relayState RelayState
 
 	// HandshakePacket records the packets used to create this hostinfo
@@ -250,12 +267,36 @@ type HostInfo struct {
 	// Used to track other hostinfos for this vpn ip since only 1 can be primary
 	// Synchronised via hostmap lock and not the hostinfo lock.
 	next, prev *HostInfo
+
+	//TODO: in, out, and others might benefit from being an atomic.Int32. We could collapse connectionManager pendingDeletion, relayUsed, and in/out into this 1 thing
+	in, out, pendingDeletion atomic.Bool
+
+	// lastUsed tracks the last time ConnectionManager checked the tunnel and it was in use.
+	// This value will be behind against actual tunnel utilization in the hot path.
+	// This should only be used by the ConnectionManagers ticker routine.
+	lastUsed time.Time
 }
 
 type ViaSender struct {
+	UdpAddr   netip.AddrPort
 	relayHI   *HostInfo // relayHI is the host info object of the relay
 	remoteIdx uint32    // remoteIdx is the index included in the header of the received packet
 	relay     *Relay    // relay contains the rest of the relay information, including the PeerIP of the host trying to communicate with us.
+	IsRelayed bool      // IsRelayed is true if the packet was sent through a relay
+}
+
+func (v ViaSender) String() string {
+	if v.IsRelayed {
+		return fmt.Sprintf("%s (relayed)", v.UdpAddr)
+	}
+	return v.UdpAddr.String()
+}
+
+func (v ViaSender) MarshalJSON() ([]byte, error) {
+	if v.IsRelayed {
+		return json.Marshal(m{"relay": v.UdpAddr})
+	}
+	return json.Marshal(m{"direct": v.UdpAddr})
 }
 
 type cachedPacket struct {
@@ -671,6 +712,7 @@ func (i *HostInfo) GetCert() *cert.CachedCertificate {
 	return nil
 }
 
+// TODO: Maybe use ViaSender here?
 func (i *HostInfo) SetRemote(remote netip.AddrPort) {
 	// We copy here because we likely got this remote from a source that reuses the object
 	if i.remote != remote {
@@ -681,14 +723,14 @@ func (i *HostInfo) SetRemote(remote netip.AddrPort) {
 
 // SetRemoteIfPreferred returns true if the remote was changed. The lastRoam
 // time on the HostInfo will also be updated.
-func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote netip.AddrPort) bool {
-	if !newRemote.IsValid() {
-		// relays have nil udp Addrs
+func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, via ViaSender) bool {
+	if via.IsRelayed {
 		return false
 	}
+
 	currentRemote := i.remote
 	if !currentRemote.IsValid() {
-		i.SetRemote(newRemote)
+		i.SetRemote(via.UdpAddr)
 		return true
 	}
 
@@ -701,7 +743,7 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote netip.AddrPort) b
 			return false
 		}
 
-		if l.Contains(newRemote.Addr()) {
+		if l.Contains(via.UdpAddr.Addr()) {
 			newIsPreferred = true
 		}
 	}
@@ -711,7 +753,7 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote netip.AddrPort) b
 		i.lastRoam = time.Now()
 		i.lastRoamRemote = currentRemote
 
-		i.SetRemote(newRemote)
+		i.SetRemote(via.UdpAddr)
 
 		return true
 	}
@@ -719,26 +761,26 @@ func (i *HostInfo) SetRemoteIfPreferred(hm *HostMap, newRemote netip.AddrPort) b
 	return false
 }
 
-func (i *HostInfo) RecvErrorExceeded() bool {
-	if i.recvError.Add(1) >= maxRecvError {
-		return true
-	}
-	return true
-}
-
-func (i *HostInfo) buildNetworks(networks, unsafeNetworks []netip.Prefix) {
-	if len(networks) == 1 && len(unsafeNetworks) == 0 {
-		// Simple case, no CIDRTree needed
-		return
+// buildNetworks fills in the networks field of HostInfo. It accepts a cert.Certificate so you never ever mix the network types up.
+func (i *HostInfo) buildNetworks(myVpnNetworksTable *bart.Lite, c cert.Certificate) {
+	if len(c.Networks()) == 1 && len(c.UnsafeNetworks()) == 0 {
+		if myVpnNetworksTable.Contains(c.Networks()[0].Addr()) {
+			return // Simple case, no BART needed
+		}
 	}
 
-	i.networks = new(bart.Lite)
-	for _, network := range networks {
-		i.networks.Insert(network)
+	i.networks = new(bart.Table[NetworkType])
+	for _, network := range c.Networks() {
+		nprefix := netip.PrefixFrom(network.Addr(), network.Addr().BitLen())
+		if myVpnNetworksTable.Contains(network.Addr()) {
+			i.networks.Insert(nprefix, NetworkTypeVPN)
+		} else {
+			i.networks.Insert(nprefix, NetworkTypeVPNPeer)
+		}
 	}
 
-	for _, network := range unsafeNetworks {
-		i.networks.Insert(network)
+	for _, network := range c.UnsafeNetworks() {
+		i.networks.Insert(network, NetworkTypeUnsafe)
 	}
 }
 

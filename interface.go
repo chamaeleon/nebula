@@ -24,23 +24,23 @@ import (
 const mtu = 9001
 
 type InterfaceConfig struct {
-	HostMap                 *HostMap
-	Outside                 udp.Conn
-	Inside                  overlay.Device
-	pki                     *PKI
-	Firewall                *Firewall
-	ServeDns                bool
-	HandshakeManager        *HandshakeManager
-	lightHouse              *LightHouse
-	checkInterval           time.Duration
-	pendingDeletionInterval time.Duration
-	DropLocalBroadcast      bool
-	DropMulticast           bool
-	routines                int
-	MessageMetrics          *MessageMetrics
-	version                 string
-	relayManager            *relayManager
-	punchy                  *Punchy
+	HostMap            *HostMap
+	Outside            udp.Conn
+	Inside             overlay.Device
+	pki                *PKI
+	Cipher             string
+	Firewall           *Firewall
+	ServeDns           bool
+	HandshakeManager   *HandshakeManager
+	lightHouse         *LightHouse
+	connectionManager  *connectionManager
+	DropLocalBroadcast bool
+	DropMulticast      bool
+	routines           int
+	MessageMetrics     *MessageMetrics
+	version            string
+	relayManager       *relayManager
+	punchy             *Punchy
 
 	tryPromoteEvery uint32
 	reQueryEvery    uint32
@@ -77,7 +77,8 @@ type Interface struct {
 	reQueryEvery    atomic.Uint32
 	reQueryWait     atomic.Int64
 
-	sendRecvErrorConfig sendRecvErrorConfig
+	sendRecvErrorConfig   recvErrorConfig
+	acceptRecvErrorConfig recvErrorConfig
 
 	// rebindCount is used to decide if an active tunnel should trigger a punch notification through a lighthouse
 	rebindCount int8
@@ -110,34 +111,34 @@ type EncWriter interface {
 	GetCertState() *CertState
 }
 
-type sendRecvErrorConfig uint8
+type recvErrorConfig uint8
 
 const (
-	sendRecvErrorAlways sendRecvErrorConfig = iota
-	sendRecvErrorNever
-	sendRecvErrorPrivate
+	recvErrorAlways recvErrorConfig = iota
+	recvErrorNever
+	recvErrorPrivate
 )
 
-func (s sendRecvErrorConfig) ShouldSendRecvError(endpoint netip.AddrPort) bool {
+func (s recvErrorConfig) ShouldRecvError(endpoint netip.AddrPort) bool {
 	switch s {
-	case sendRecvErrorPrivate:
+	case recvErrorPrivate:
 		return endpoint.Addr().IsPrivate()
-	case sendRecvErrorAlways:
+	case recvErrorAlways:
 		return true
-	case sendRecvErrorNever:
+	case recvErrorNever:
 		return false
 	default:
-		panic(fmt.Errorf("invalid sendRecvErrorConfig value: %d", s))
+		panic(fmt.Errorf("invalid recvErrorConfig value: %d", s))
 	}
 }
 
-func (s sendRecvErrorConfig) String() string {
+func (s recvErrorConfig) String() string {
 	switch s {
-	case sendRecvErrorAlways:
+	case recvErrorAlways:
 		return "always"
-	case sendRecvErrorNever:
+	case recvErrorNever:
 		return "never"
-	case sendRecvErrorPrivate:
+	case recvErrorPrivate:
 		return "private"
 	default:
 		return fmt.Sprintf("invalid(%d)", s)
@@ -156,6 +157,9 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 	}
 	if c.Firewall == nil {
 		return nil, errors.New("no firewall rules")
+	}
+	if c.connectionManager == nil {
+		return nil, errors.New("no connection manager")
 	}
 
 	cs := c.pki.getCertState()
@@ -181,7 +185,7 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 		myVpnAddrsTable:       cs.myVpnAddrsTable,
 		myBroadcastAddrsTable: cs.myVpnBroadcastAddrsTable,
 		relayManager:          c.relayManager,
-
+		connectionManager:     c.connectionManager,
 		conntrackCacheTimeout: c.ConntrackCacheTimeout,
 
 		metricHandshakes: metrics.GetOrRegisterHistogram("handshakes", nil, metrics.NewExpDecaySample(1028, 0.015)),
@@ -198,7 +202,7 @@ func NewInterface(ctx context.Context, c *InterfaceConfig) (*Interface, error) {
 	ifce.reQueryEvery.Store(c.reQueryEvery)
 	ifce.reQueryWait.Store(int64(c.reQueryWait))
 
-	ifce.connectionManager = newConnectionManager(ctx, c.l, ifce, c.checkInterval, c.pendingDeletionInterval, c.punchy)
+	ifce.connectionManager.intf = ifce
 
 	return ifce, nil
 }
@@ -218,6 +222,13 @@ func (f *Interface) activate() {
 		WithField("build", f.version).WithField("udpAddr", addr).
 		WithField("boringcrypto", boringEnabled()).
 		Info("Nebula interface is active")
+
+	if f.routines > 1 {
+		if !f.inside.SupportsMultiqueue() || !f.outside.SupportsMultipleReaders() {
+			f.routines = 1
+			f.l.Warn("routines is not supported on this platform, falling back to a single routine")
+		}
+	}
 
 	metrics.GetOrRegisterGauge("routines", nil).Update(int64(f.routines))
 
@@ -269,7 +280,7 @@ func (f *Interface) listenOut(i int) {
 	nb := make([]byte, 12, 12)
 
 	li.ListenOut(func(fromUdpAddr netip.AddrPort, payload []byte) {
-		f.readOutsidePackets(fromUdpAddr, nil, plaintext[:0], payload, h, fwPacket, lhh, nb, i, ctCache.Get(f.l))
+		f.readOutsidePackets(ViaSender{UdpAddr: fromUdpAddr}, plaintext[:0], payload, h, fwPacket, lhh, nb, i, ctCache.Get(f.l))
 	})
 }
 
@@ -302,6 +313,7 @@ func (f *Interface) listenIn(reader io.ReadWriteCloser, i int) {
 func (f *Interface) RegisterConfigChangeCallbacks(c *config.C) {
 	c.RegisterReloadCallback(f.reloadFirewall)
 	c.RegisterReloadCallback(f.reloadSendRecvError)
+	c.RegisterReloadCallback(f.reloadAcceptRecvError)
 	c.RegisterReloadCallback(f.reloadDisconnectInvalid)
 	c.RegisterReloadCallback(f.reloadMisc)
 
@@ -365,21 +377,45 @@ func (f *Interface) reloadSendRecvError(c *config.C) {
 
 		switch stringValue {
 		case "always":
-			f.sendRecvErrorConfig = sendRecvErrorAlways
+			f.sendRecvErrorConfig = recvErrorAlways
 		case "never":
-			f.sendRecvErrorConfig = sendRecvErrorNever
+			f.sendRecvErrorConfig = recvErrorNever
 		case "private":
-			f.sendRecvErrorConfig = sendRecvErrorPrivate
+			f.sendRecvErrorConfig = recvErrorPrivate
 		default:
 			if c.GetBool("listen.send_recv_error", true) {
-				f.sendRecvErrorConfig = sendRecvErrorAlways
+				f.sendRecvErrorConfig = recvErrorAlways
 			} else {
-				f.sendRecvErrorConfig = sendRecvErrorNever
+				f.sendRecvErrorConfig = recvErrorNever
 			}
 		}
 
 		f.l.WithField("sendRecvError", f.sendRecvErrorConfig.String()).
 			Info("Loaded send_recv_error config")
+	}
+}
+
+func (f *Interface) reloadAcceptRecvError(c *config.C) {
+	if c.InitialLoad() || c.HasChanged("listen.accept_recv_error") {
+		stringValue := c.GetString("listen.accept_recv_error", "always")
+
+		switch stringValue {
+		case "always":
+			f.acceptRecvErrorConfig = recvErrorAlways
+		case "never":
+			f.acceptRecvErrorConfig = recvErrorNever
+		case "private":
+			f.acceptRecvErrorConfig = recvErrorPrivate
+		default:
+			if c.GetBool("listen.accept_recv_error", true) {
+				f.acceptRecvErrorConfig = recvErrorAlways
+			} else {
+				f.acceptRecvErrorConfig = recvErrorNever
+			}
+		}
+
+		f.l.WithField("acceptRecvError", f.acceptRecvErrorConfig.String()).
+			Info("Loaded accept_recv_error config")
 	}
 }
 

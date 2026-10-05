@@ -1,14 +1,16 @@
 //go:build e2e_testing
-// +build e2e_testing
 
 package udp
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"net/netip"
+	"os"
+	"sync"
 	"sync/atomic"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/header"
 )
@@ -19,55 +21,110 @@ type Packet struct {
 	Data []byte
 }
 
+// Copy returns a fresh *Packet (from the freelist) with a duplicate Data buffer.
 func (u *Packet) Copy() *Packet {
-	n := &Packet{
-		To:   u.To,
-		From: u.From,
-		Data: make([]byte, len(u.Data)),
+	n := acquirePacket()
+	n.To = u.To
+	n.From = u.From
+	if cap(n.Data) < len(u.Data) {
+		n.Data = make([]byte, len(u.Data))
+	} else {
+		n.Data = n.Data[:len(u.Data)]
 	}
-
 	copy(n.Data, u.Data)
 	return n
 }
 
+// Release returns p to the harness packet freelist.
+// Callers that pull a *Packet from Get / TxPackets must Release when done.
+// Channel-backed instead of sync.Pool because sync.Pool's per-P caches drain badly under cross-goroutine Get/Put,
+// and putting a []byte in a Pool escapes the slice header to heap.
+func (p *Packet) Release() {
+	if p == nil {
+		return
+	}
+	p.Data = p.Data[:0]
+	select {
+	case packetFreelist <- p:
+	default:
+		// Freelist full; drop the *Packet for the GC.
+	}
+}
+
+// packetFreelist retains *Packet structs (and their backing Data arrays) so steady-state allocation drops to zero.
+var packetFreelist = make(chan *Packet, 64)
+
+func acquirePacket() *Packet {
+	select {
+	case p := <-packetFreelist:
+		return p
+	default:
+		return &Packet{}
+	}
+}
+
 type TesterConn struct {
-	Addr netip.AddrPort
+	// addr is read by nebula's own goroutines on every send and by the router's flow renderer, and a test can
+	// move it mid-run to simulate roaming, so it is atomic rather than a plain field.
+	addr atomic.Pointer[netip.AddrPort]
 
 	RxPackets chan *Packet // Packets to receive into nebula
 	TxPackets chan *Packet // Packets transmitted outside by nebula
 
-	closed atomic.Bool
-	l      *logrus.Logger
+	// done is closed exactly once by Close. Senders select on it so they
+	// never race with a channel close; readers exit when it fires. The
+	// packet channels are intentionally never closed - that was the source
+	// of `send on closed channel` panics when a WriteTo/Send from another
+	// goroutine passed the close check and reached the send just after
+	// Close ran.
+	done      chan struct{}
+	closeOnce sync.Once
+
+	l *slog.Logger
 }
 
-func NewListener(l *logrus.Logger, ip netip.Addr, port int, _ bool, _ int) (Conn, error) {
-	return &TesterConn{
-		Addr:      netip.AddrPortFrom(ip, uint16(port)),
+func NewListener(l *slog.Logger, s Settings) (Conn, error) {
+	c := &TesterConn{
 		RxPackets: make(chan *Packet, 10),
 		TxPackets: make(chan *Packet, 10),
+		done:      make(chan struct{}),
 		l:         l,
-	}, nil
+	}
+	c.SetAddr(s.Listen)
+	return c, nil
+}
+
+// GetAddr returns the underlay address this conn currently sends from.
+func (u *TesterConn) GetAddr() netip.AddrPort {
+	return *u.addr.Load()
+}
+
+// SetAddr moves this conn to a new underlay address, standing in for a host waking up on a different network.
+func (u *TesterConn) SetAddr(addr netip.AddrPort) {
+	u.addr.Store(&addr)
 }
 
 // Send will place a UdpPacket onto the receive queue for nebula to consume
 // this is an encrypted packet or a handshake message in most cases
 // packets were transmitted from another nebula node, you can send them with Tun.Send
 func (u *TesterConn) Send(packet *Packet) {
-	if u.closed.Load() {
-		return
+	if u.l.Enabled(context.Background(), slog.LevelDebug) {
+		// Parse the header only under debug logging, otherwise the
+		// allocation would show up in every Send call.
+		var h header.H
+		if err := h.Parse(packet.Data); err != nil {
+			panic(err)
+		}
+		u.l.Debug("UDP receiving injected packet",
+			"header", &h,
+			"udpAddr", packet.From,
+			"dataLen", len(packet.Data),
+		)
 	}
-
-	h := &header.H{}
-	if err := h.Parse(packet.Data); err != nil {
-		panic(err)
+	select {
+	case <-u.done:
+	case u.RxPackets <- packet:
 	}
-	if u.l.Level >= logrus.DebugLevel {
-		u.l.WithField("header", h).
-			WithField("udpAddr", packet.From).
-			WithField("dataLen", len(packet.Data)).
-			Debug("UDP receiving injected packet")
-	}
-	u.RxPackets <- packet
 }
 
 // Get will pull a UdpPacket from the transmit queue
@@ -75,7 +132,12 @@ func (u *TesterConn) Send(packet *Packet) {
 // packets were ingested from the tun side (in most cases), you can send them with Tun.Send
 func (u *TesterConn) Get(block bool) *Packet {
 	if block {
-		return <-u.TxPackets
+		select {
+		case <-u.done:
+			return nil
+		case p := <-u.TxPackets:
+			return p
+		}
 	}
 
 	select {
@@ -91,28 +153,47 @@ func (u *TesterConn) Get(block bool) *Packet {
 //********************************************************************************************************************//
 
 func (u *TesterConn) WriteTo(b []byte, addr netip.AddrPort) error {
-	if u.closed.Load() {
-		return io.ErrClosedPipe
+	p := acquirePacket()
+	if cap(p.Data) < len(b) {
+		p.Data = make([]byte, len(b))
+	} else {
+		p.Data = p.Data[:len(b)]
 	}
-
-	p := &Packet{
-		Data: make([]byte, len(b), len(b)),
-		From: u.Addr,
-		To:   addr,
-	}
-
 	copy(p.Data, b)
-	u.TxPackets <- p
-	return nil
+	p.From = u.GetAddr()
+	p.To = addr
+	select {
+	case <-u.done:
+		p.Release()
+		return io.ErrClosedPipe
+	case u.TxPackets <- p:
+		return nil
+	}
+}
+func (u *TesterConn) WriteBatch(bufs [][]byte, addrs []netip.AddrPort) (int, error) {
+	written := 0
+	for i, b := range bufs {
+		if err := u.WriteTo(b, addrs[i]); err == nil {
+			written++
+		} else {
+			u.l.Debug("failed to write packet in batch", "udpAddr", addrs[i], "error", err)
+		}
+	}
+	return written, nil
 }
 
-func (u *TesterConn) ListenOut(r EncReader) {
+func (u *TesterConn) ListenOut(r EncReader, flush func()) error {
 	for {
-		p, ok := <-u.RxPackets
-		if !ok {
-			return
+		select {
+		case <-u.done:
+			return os.ErrClosed
+		case p := <-u.RxPackets:
+			r(p.From, p.Data[:len(p.Data):len(p.Data)])
+			// The batcher borrows plaintext decrypted in place inside p.Data
+			// until Flush, so the packet must stay alive across flush()
+			flush()
+			p.Release()
 		}
-		r(p.From, p.Data)
 	}
 }
 
@@ -124,7 +205,7 @@ func NewUDPStatsEmitter(_ []Conn) func() {
 }
 
 func (u *TesterConn) LocalAddr() (netip.AddrPort, error) {
-	return u.Addr, nil
+	return u.GetAddr(), nil
 }
 
 func (u *TesterConn) SupportsMultipleReaders() bool {
@@ -136,9 +217,8 @@ func (u *TesterConn) Rebind() error {
 }
 
 func (u *TesterConn) Close() error {
-	if u.closed.CompareAndSwap(false, true) {
-		close(u.RxPackets)
-		close(u.TxPackets)
-	}
+	u.closeOnce.Do(func() {
+		close(u.done)
+	})
 	return nil
 }

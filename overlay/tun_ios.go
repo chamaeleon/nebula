@@ -1,5 +1,4 @@
 //go:build ios && !e2e_testing
-// +build ios,!e2e_testing
 
 package overlay
 
@@ -7,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/netip"
 	"os"
 	"sync"
@@ -14,10 +14,11 @@ import (
 	"syscall"
 
 	"github.com/gaissmai/bart"
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/routing"
 	"github.com/slackhq/nebula/util"
+	"golang.org/x/sys/unix"
 )
 
 type tun struct {
@@ -25,14 +26,20 @@ type tun struct {
 	vpnNetworks []netip.Prefix
 	Routes      atomic.Pointer[[]Route]
 	routeTree   atomic.Pointer[bart.Table[routing.Gateways]]
-	l           *logrus.Logger
+	l           *slog.Logger
 }
 
-func newTun(_ *config.C, _ *logrus.Logger, _ []netip.Prefix, _ bool) (*tun, error) {
+func newTun(_ *config.C, _ *slog.Logger, _ []netip.Prefix, _ bool) (*tun, error) {
 	return nil, fmt.Errorf("newTun not supported in iOS")
 }
 
-func newTunFromFd(c *config.C, l *logrus.Logger, deviceFd int, vpnNetworks []netip.Prefix) (*tun, error) {
+func newTunFromFd(c *config.C, l *slog.Logger, deviceFd int, vpnNetworks []netip.Prefix) (*tun, error) {
+	if err := unix.SetNonblock(deviceFd, true); err != nil {
+		// We own the fd from the moment it is handed to us, same as the reload error path below
+		_ = unix.Close(deviceFd)
+		return nil, fmt.Errorf("failed to set the tun fd to non-blocking mode: %w", err)
+	}
+
 	file := os.NewFile(uintptr(deviceFd), "/dev/tun")
 	t := &tun{
 		vpnNetworks:     vpnNetworks,
@@ -42,6 +49,7 @@ func newTunFromFd(c *config.C, l *logrus.Logger, deviceFd int, vpnNetworks []net
 
 	err := t.reload(c, true)
 	if err != nil {
+		_ = file.Close()
 		return nil, err
 	}
 
@@ -151,10 +159,6 @@ func (t *tun) Name() string {
 	return "iOS"
 }
 
-func (t *tun) SupportsMultiqueue() bool {
-	return false
-}
-
-func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("TODO: multiqueue not implemented for ios")
+func (t *tun) Queues(int) ([]tio.Queue, error) {
+	return []tio.Queue{tio.NewSingleQueue(t, defaultBatchBufSize)}, nil
 }

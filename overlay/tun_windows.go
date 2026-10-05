@@ -1,23 +1,23 @@
 //go:build !e2e_testing
-// +build !e2e_testing
 
 package overlay
 
 import (
 	"crypto"
 	"fmt"
-	"io"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
 
 	"github.com/gaissmai/bart"
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/routing"
 	"github.com/slackhq/nebula/util"
 	"github.com/slackhq/nebula/wintun"
@@ -25,24 +25,37 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
+type closer interface {
+	Close()
+}
+
 const tunGUIDLabel = "Fixed Nebula Windows GUID v1"
 
 type winTun struct {
-	Device      string
-	vpnNetworks []netip.Prefix
-	MTU         int
-	Routes      atomic.Pointer[[]Route]
-	routeTree   atomic.Pointer[bart.Table[routing.Gateways]]
-	l           *logrus.Logger
+	Device          string
+	vpnNetworks     []netip.Prefix
+	MTU             int
+	Routes          atomic.Pointer[[]Route]
+	routeTree       atomic.Pointer[bart.Table[routing.Gateways]]
+	guid            windows.GUID
+	networkCategory networkCategory
+	setCategory     bool
+	bypassWDF       bool
+	wdfBypass       closer
+	l               *slog.Logger
 
 	tun *wintun.NativeTun
 }
 
-func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ []netip.Prefix) (Device, error) {
+func (t *winTun) Read(b []byte) (int, error) {
+	return t.tun.Read(b, 0)
+}
+
+func newTunFromFd(_ *config.C, _ *slog.Logger, _ int, _ []netip.Prefix) (Device, error) {
 	return nil, fmt.Errorf("newTunFromFd not supported in Windows")
 }
 
-func newTun(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, _ bool) (*winTun, error) {
+func newTun(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, _ bool) (*winTun, error) {
 	err := checkWinTunExists()
 	if err != nil {
 		return nil, fmt.Errorf("can not load the wintun driver: %w", err)
@@ -54,11 +67,20 @@ func newTun(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, _ bool) (
 		return nil, fmt.Errorf("generate GUID failed: %w", err)
 	}
 
+	cat, setCat, err := parseNetworkCategory(c.GetString("tun.network_category", "private"))
+	if err != nil {
+		return nil, err
+	}
+
 	t := &winTun{
-		Device:      deviceName,
-		vpnNetworks: vpnNetworks,
-		MTU:         c.GetInt("tun.mtu", DefaultMTU),
-		l:           l,
+		Device:          deviceName,
+		vpnNetworks:     vpnNetworks,
+		MTU:             c.GetInt("tun.mtu", DefaultMTU),
+		guid:            *guid,
+		networkCategory: cat,
+		setCategory:     setCat,
+		bypassWDF:       c.GetBool("tun.windows_bypass_wdf", true),
+		l:               l,
 	}
 
 	err = t.reload(c, true)
@@ -71,10 +93,13 @@ func newTun(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, _ bool) (
 	if err != nil {
 		// Windows 10 has an issue with unclean shutdowns not fully cleaning up the wintun device.
 		// Trying a second time resolves the issue.
-		l.WithError(err).Debug("Failed to create wintun device, retrying")
+		l.Debug("Failed to create wintun device, retrying", "error", err)
 		tunDevice, err = wintun.CreateTUNWithRequestedGUID(deviceName, guid, t.MTU)
 		if err != nil {
-			return nil, fmt.Errorf("create TUN device failed: %w", err)
+			return nil, &NameError{
+				Name:       deviceName,
+				Underlying: fmt.Errorf("create TUN device failed: %w", err),
+			}
 		}
 	}
 	t.tun = tunDevice.(*wintun.NativeTun)
@@ -139,6 +164,17 @@ func (t *winTun) Activate() error {
 		return err
 	}
 
+	if t.setCategory {
+		// The wintun adapter takes a moment to register with the Network List
+		// Manager, so we apply the category in the background and retry until
+		// it shows up.
+		go applyNetworkCategory(t.l, t.guid, t.networkCategory)
+	}
+
+	if t.bypassWDF {
+		t.wdfBypass = installInterfaceBypass(t.l, uint64(t.tun.LUID()))
+	}
+
 	return nil
 }
 
@@ -146,6 +182,7 @@ func (t *winTun) addRoutes(logErrors bool) error {
 	luid := winipcfg.LUID(t.tun.LUID())
 	routes := *t.Routes.Load()
 	foundDefault4 := false
+	carriesV6 := slices.ContainsFunc(t.vpnNetworks, func(p netip.Prefix) bool { return p.Addr().Is6() })
 
 	for _, r := range routes {
 		if len(r.Via) == 0 || !r.Install {
@@ -153,11 +190,11 @@ func (t *winTun) addRoutes(logErrors bool) error {
 			continue
 		}
 
-		// Add our unsafe route
-		// Windows does not support multipath routes natively, so we install only a single route.
-		// This is not a problem as traffic will always be sent to Nebula which handles the multipath routing internally.
-		// In effect this provides multipath routing support to windows supporting loadbalancing and redundancy.
-		err := luid.AddRoute(r.Cidr, r.Via[0].Addr(), uint32(r.Metric))
+		// A v6 unsafe_route is legal under a v4-only cert; uninstalled ones put nothing on the adapter.
+		carriesV6 = carriesV6 || r.Cidr.Addr().Is6()
+
+		// Add our unsafe route as an on-link route to the nebula tun device.
+		err := luid.AddRoute(r.Cidr, unspecifiedNextHop(r.Cidr), uint32(r.Metric))
 		if err != nil {
 			retErr := util.NewContextualError("Failed to add route", map[string]any{"route": r}, err)
 			if logErrors {
@@ -167,7 +204,7 @@ func (t *winTun) addRoutes(logErrors bool) error {
 				return retErr
 			}
 		} else {
-			t.l.WithField("route", r).Info("Added route")
+			t.l.Info("Added route", "route", r)
 		}
 
 		if !foundDefault4 {
@@ -177,6 +214,11 @@ func (t *winTun) addRoutes(logErrors bool) error {
 		}
 	}
 
+	return t.setMTU(luid, foundDefault4, carriesV6)
+}
+
+// setMTU applies tun.mtu per address family. The default route metric rides along on the v4 handle.
+func (t *winTun) setMTU(luid winipcfg.LUID, foundDefault4, carriesV6 bool) error {
 	ipif, err := luid.IPInterface(windows.AF_INET)
 	if err != nil {
 		return fmt.Errorf("failed to get ip interface: %w", err)
@@ -191,6 +233,25 @@ func (t *winTun) addRoutes(logErrors bool) error {
 	if err := ipif.Set(); err != nil {
 		return fmt.Errorf("failed to set ip interface: %w", err)
 	}
+
+	// Windows tracks NLMTU per family and wintun sets neither, so v6 keeps the adapter default of 65535.
+	// Gated so a v4-only overlay under 1280 boots; a v6 one deliberately does not, as linux also refuses.
+	if !carriesV6 {
+		return nil
+	}
+
+	ipif6, err := luid.IPInterface(windows.AF_INET6)
+	if err != nil {
+		// No v6 on the adapter means there is no NLMTU to get wrong. A failed Set below is not the same thing.
+		t.l.Info("Skipping ipv6 MTU, no ipv6 interface on this adapter", "error", err)
+		return nil
+	}
+
+	ipif6.NLMTU = uint32(t.MTU)
+	if err := ipif6.Set(); err != nil {
+		return fmt.Errorf("failed to set ipv6 interface: %w", err)
+	}
+
 	return nil
 }
 
@@ -203,11 +264,11 @@ func (t *winTun) removeRoutes(routes []Route) error {
 		}
 
 		// See comment on luid.AddRoute
-		err := luid.DeleteRoute(r.Cidr, r.Via[0].Addr())
+		err := luid.DeleteRoute(r.Cidr, unspecifiedNextHop(r.Cidr))
 		if err != nil {
-			t.l.WithError(err).WithField("route", r).Error("Failed to remove route")
+			t.l.Error("Failed to remove route", "error", err, "route", r)
 		} else {
-			t.l.WithField("route", r).Info("Removed route")
+			t.l.Info("Removed route", "route", r)
 		}
 	}
 	return nil
@@ -226,20 +287,12 @@ func (t *winTun) Name() string {
 	return t.Device
 }
 
-func (t *winTun) Read(b []byte) (int, error) {
-	return t.tun.Read(b, 0)
-}
-
 func (t *winTun) Write(b []byte) (int, error) {
 	return t.tun.Write(b, 0)
 }
 
-func (t *winTun) SupportsMultiqueue() bool {
-	return false
-}
-
-func (t *winTun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("TODO: multiqueue not implemented for windows")
+func (t *winTun) Queues(int) ([]tio.Queue, error) {
+	return []tio.Queue{tio.NewSingleQueue(t, defaultBatchBufSize)}, nil
 }
 
 func (t *winTun) Close() error {
@@ -255,7 +308,19 @@ func (t *winTun) Close() error {
 	_ = luid.FlushDNS(windows.AF_INET)
 	_ = luid.FlushDNS(windows.AF_INET6)
 
+	if t.wdfBypass != nil {
+		t.wdfBypass.Close()
+		t.wdfBypass = nil
+	}
+
 	return t.tun.Close()
+}
+
+func unspecifiedNextHop(p netip.Prefix) netip.Addr {
+	if p.Addr().Is4() {
+		return netip.IPv4Unspecified()
+	}
+	return netip.IPv6Unspecified()
 }
 
 func generateGUIDByDeviceName(name string) (*windows.GUID, error) {

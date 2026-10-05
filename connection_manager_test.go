@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flynn/noise"
+	"github.com/rcrowley/go-metrics"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/overlay/overlaytest"
 	"github.com/slackhq/nebula/test"
 	"github.com/slackhq/nebula/udp"
 	"github.com/stretchr/testify/assert"
@@ -21,10 +22,13 @@ func newTestLighthouse() *LightHouse {
 		l:         test.NewLogger(),
 		addrMap:   map[netip.Addr]*RemoteList{},
 		queryChan: make(chan netip.Addr, 10),
+		// Nothing drains queryChan here, so an 11th query is dropped.
+		queryDropped: metrics.NilCounter{},
 	}
 	lighthouses := []netip.Addr{}
 	staticList := map[netip.Addr]struct{}{}
 
+	lh.localAddrsFn = func(*LocalAllowList) []netip.Addr { return nil }
 	lh.lighthouses.Store(&lighthouses)
 	lh.staticList.Store(&staticList)
 
@@ -46,13 +50,13 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 		initiatingVersion: cert.Version1,
 		privateKey:        []byte{},
 		v1Cert:            &dummyCert{version: cert.Version1},
-		v1HandshakeBytes:  []byte{},
+		v1Credential:      nil,
 	}
 
 	lh := newTestLighthouse()
 	ifce := &Interface{
 		hostMap:          hostMap,
-		inside:           &test.NoopTun{},
+		inside:           &overlaytest.NoopTun{},
 		outside:          &udp.NoopConn{},
 		firewall:         &Firewall{},
 		lightHouse:       lh,
@@ -63,9 +67,9 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 	ifce.pki.cs.Store(cs)
 
 	// Create manager
-	conf := config.NewC(l)
-	punchy := NewPunchyFromConfig(l, conf)
-	nc := newConnectionManagerFromConfig(l, conf, hostMap, punchy)
+	conf := config.NewC(test.NewLogger())
+	punchy := NewPunchyFromConfig(test.NewLogger(), conf, nil)
+	nc := newConnectionManagerFromConfig(test.NewLogger(), conf, hostMap, punchy)
 	nc.intf = ifce
 	p := []byte("")
 	nb := make([]byte, 12, 12)
@@ -79,32 +83,31 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 	}
 	hostinfo.ConnectionState = &ConnectionState{
 		myCert: &dummyCert{version: cert.Version1},
-		H:      &noise.HandshakeState{},
 	}
 	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
 
 	// We saw traffic out to vpnIp
 	nc.Out(hostinfo)
 	nc.In(hostinfo)
-	assert.False(t, hostinfo.pendingDeletion.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
 	assert.Contains(t, nc.hostMap.Hosts, hostinfo.vpnAddrs[0])
 	assert.Contains(t, nc.hostMap.Indexes, hostinfo.localIndexId)
-	assert.True(t, hostinfo.out.Load())
-	assert.True(t, hostinfo.in.Load())
+	assert.True(t, hostinfo.sentSinceCheck())
+	assert.True(t, (hostinfo.state.Load()&stateIn != 0))
 
 	// Do a traffic check tick, should not be pending deletion but should not have any in/out packets recorded
 	nc.doTrafficCheck(hostinfo.localIndexId, p, nb, out, time.Now())
-	assert.False(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 
 	// Do another traffic check tick, this host should be pending deletion now
 	nc.Out(hostinfo)
-	assert.True(t, hostinfo.out.Load())
+	assert.True(t, hostinfo.sentSinceCheck())
 	nc.doTrafficCheck(hostinfo.localIndexId, p, nb, out, time.Now())
-	assert.True(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.True(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 	assert.Contains(t, nc.hostMap.Indexes, hostinfo.localIndexId)
 	assert.Contains(t, nc.hostMap.Hosts, hostinfo.vpnAddrs[0])
 
@@ -129,13 +132,13 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 		initiatingVersion: cert.Version1,
 		privateKey:        []byte{},
 		v1Cert:            &dummyCert{version: cert.Version1},
-		v1HandshakeBytes:  []byte{},
+		v1Credential:      nil,
 	}
 
 	lh := newTestLighthouse()
 	ifce := &Interface{
 		hostMap:          hostMap,
-		inside:           &test.NoopTun{},
+		inside:           &overlaytest.NoopTun{},
 		outside:          &udp.NoopConn{},
 		firewall:         &Firewall{},
 		lightHouse:       lh,
@@ -146,9 +149,9 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 	ifce.pki.cs.Store(cs)
 
 	// Create manager
-	conf := config.NewC(l)
-	punchy := NewPunchyFromConfig(l, conf)
-	nc := newConnectionManagerFromConfig(l, conf, hostMap, punchy)
+	conf := config.NewC(test.NewLogger())
+	punchy := NewPunchyFromConfig(test.NewLogger(), conf, nil)
+	nc := newConnectionManagerFromConfig(test.NewLogger(), conf, hostMap, punchy)
 	nc.intf = ifce
 	p := []byte("")
 	nb := make([]byte, 12, 12)
@@ -162,42 +165,114 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 	}
 	hostinfo.ConnectionState = &ConnectionState{
 		myCert: &dummyCert{version: cert.Version1},
-		H:      &noise.HandshakeState{},
 	}
 	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
 
 	// We saw traffic out to vpnIp
 	nc.Out(hostinfo)
 	nc.In(hostinfo)
-	assert.True(t, hostinfo.in.Load())
-	assert.True(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.pendingDeletion.Load())
+	assert.True(t, (hostinfo.state.Load()&stateIn != 0))
+	assert.True(t, hostinfo.sentSinceCheck())
+	assert.False(t, hostinfo.isPendingDeletion())
 	assert.Contains(t, nc.hostMap.Hosts, hostinfo.vpnAddrs[0])
 	assert.Contains(t, nc.hostMap.Indexes, hostinfo.localIndexId)
 
 	// Do a traffic check tick, should not be pending deletion but should not have any in/out packets recorded
 	nc.doTrafficCheck(hostinfo.localIndexId, p, nb, out, time.Now())
-	assert.False(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 
 	// Do another traffic check tick, this host should be pending deletion now
 	nc.Out(hostinfo)
 	nc.doTrafficCheck(hostinfo.localIndexId, p, nb, out, time.Now())
-	assert.True(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.True(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 	assert.Contains(t, nc.hostMap.Indexes, hostinfo.localIndexId)
 	assert.Contains(t, nc.hostMap.Hosts, hostinfo.vpnAddrs[0])
 
 	// We saw traffic, should no longer be pending deletion
 	nc.In(hostinfo)
 	nc.doTrafficCheck(hostinfo.localIndexId, p, nb, out, time.Now())
-	assert.False(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 	assert.Contains(t, nc.hostMap.Indexes, hostinfo.localIndexId)
 	assert.Contains(t, nc.hostMap.Hosts, hostinfo.vpnAddrs[0])
+}
+
+func Test_NewConnectionManager_CounterLimits(t *testing.T) {
+	l := test.NewLogger()
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	vpnIp := netip.MustParseAddr("172.1.1.2")
+	preferredRanges := []netip.Prefix{localrange}
+
+	// Very incomplete mock objects
+	hostMap := newHostMap(l)
+	hostMap.preferredRanges.Store(&preferredRanges)
+
+	cs := &CertState{
+		initiatingVersion: cert.Version1,
+		privateKey:        []byte{},
+		v1Cert:            &dummyCert{version: cert.Version1},
+		v1Credential:      nil,
+	}
+
+	lh := newTestLighthouse()
+	ifce := &Interface{
+		hostMap:          hostMap,
+		inside:           &overlaytest.NoopTun{},
+		outside:          &udp.NoopConn{},
+		firewall:         &Firewall{},
+		lightHouse:       lh,
+		pki:              &PKI{},
+		myVpnAddrs:       []netip.Addr{netip.MustParseAddr("172.1.1.1")}, // sorts below vpnIp so shouldSwapPrimary can proceed
+		handshakeManager: NewHandshakeManager(l, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
+		l:                l,
+	}
+	ifce.pki.cs.Store(cs)
+
+	conf := config.NewC(test.NewLogger())
+	punchy := NewPunchyFromConfig(test.NewLogger(), conf, nil)
+	nc := newConnectionManagerFromConfig(test.NewLogger(), conf, hostMap, punchy)
+	nc.intf = ifce
+
+	hostinfo := &HostInfo{
+		vpnAddrs:      []netip.Addr{vpnIp},
+		localIndexId:  1099,
+		remoteIndexId: 9901,
+	}
+	hostinfo.ConnectionState = &ConnectionState{
+		myCert: &dummyCert{version: cert.Version1},
+	}
+	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
+
+	// Below the rehandshake threshold, no handshake is started
+	hostinfo.ConnectionState.messageCounter.Store(RehandshakeAfterMessages - 1)
+	nc.tryRehandshake(hostinfo)
+	assert.Nil(t, ifce.handshakeManager.QueryVpnAddr(vpnIp))
+
+	// A tunnel on its current cert would normally swap to primary
+	assert.True(t, nc.shouldSwapPrimary(hostinfo))
+
+	// At the rehandshake threshold, a new handshake is started
+	hostinfo.ConnectionState.messageCounter.Store(RehandshakeAfterMessages)
+	nc.tryRehandshake(hostinfo)
+	assert.NotNil(t, ifce.handshakeManager.QueryVpnAddr(vpnIp))
+
+	// An exhausted tunnel being rolled must never swap back to primary onto its spent key
+	assert.False(t, nc.shouldSwapPrimary(hostinfo))
+
+	// Still below the reject limit, the tunnel stays up
+	nc.In(hostinfo)
+	decision, _, _ := nc.makeTrafficDecision(hostinfo.localIndexId, time.Now())
+	assert.Equal(t, tryRehandshake, decision)
+
+	// At the reject limit, the tunnel is deleted locally without a doomed CloseTunnel notify
+	hostinfo.ConnectionState.messageCounter.Store(RejectAfterMessages)
+	decision, _, _ = nc.makeTrafficDecision(hostinfo.localIndexId, time.Now())
+	assert.Equal(t, deleteTunnel, decision)
 }
 
 func Test_NewConnectionManager_DisconnectInactive(t *testing.T) {
@@ -214,13 +289,13 @@ func Test_NewConnectionManager_DisconnectInactive(t *testing.T) {
 		initiatingVersion: cert.Version1,
 		privateKey:        []byte{},
 		v1Cert:            &dummyCert{version: cert.Version1},
-		v1HandshakeBytes:  []byte{},
+		v1Credential:      nil,
 	}
 
 	lh := newTestLighthouse()
 	ifce := &Interface{
 		hostMap:          hostMap,
-		inside:           &test.NoopTun{},
+		inside:           &overlaytest.NoopTun{},
 		outside:          &udp.NoopConn{},
 		firewall:         &Firewall{},
 		lightHouse:       lh,
@@ -231,12 +306,12 @@ func Test_NewConnectionManager_DisconnectInactive(t *testing.T) {
 	ifce.pki.cs.Store(cs)
 
 	// Create manager
-	conf := config.NewC(l)
+	conf := config.NewC(test.NewLogger())
 	conf.Settings["tunnels"] = map[string]any{
 		"drop_inactive": true,
 	}
-	punchy := NewPunchyFromConfig(l, conf)
-	nc := newConnectionManagerFromConfig(l, conf, hostMap, punchy)
+	punchy := NewPunchyFromConfig(test.NewLogger(), conf, nil)
+	nc := newConnectionManagerFromConfig(test.NewLogger(), conf, hostMap, punchy)
 	assert.True(t, nc.dropInactive.Load())
 	nc.intf = ifce
 
@@ -248,38 +323,37 @@ func Test_NewConnectionManager_DisconnectInactive(t *testing.T) {
 	}
 	hostinfo.ConnectionState = &ConnectionState{
 		myCert: &dummyCert{version: cert.Version1},
-		H:      &noise.HandshakeState{},
 	}
 	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
 
 	// Do a traffic check tick, in and out should be cleared but should not be pending deletion
 	nc.Out(hostinfo)
 	nc.In(hostinfo)
-	assert.True(t, hostinfo.out.Load())
-	assert.True(t, hostinfo.in.Load())
+	assert.True(t, hostinfo.sentSinceCheck())
+	assert.True(t, (hostinfo.state.Load()&stateIn != 0))
 
 	now := time.Now()
 	decision, _, _ := nc.makeTrafficDecision(hostinfo.localIndexId, now)
 	assert.Equal(t, tryRehandshake, decision)
 	assert.Equal(t, now, hostinfo.lastUsed)
-	assert.False(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 
 	decision, _, _ = nc.makeTrafficDecision(hostinfo.localIndexId, now.Add(time.Second*5))
 	assert.Equal(t, doNothing, decision)
 	assert.Equal(t, now, hostinfo.lastUsed)
-	assert.False(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 
 	// Do another traffic check tick, should still not be pending deletion
 	decision, _, _ = nc.makeTrafficDecision(hostinfo.localIndexId, now.Add(time.Second*10))
 	assert.Equal(t, doNothing, decision)
 	assert.Equal(t, now, hostinfo.lastUsed)
-	assert.False(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 	assert.Contains(t, nc.hostMap.Indexes, hostinfo.localIndexId)
 	assert.Contains(t, nc.hostMap.Hosts, hostinfo.vpnAddrs[0])
 
@@ -287,9 +361,9 @@ func Test_NewConnectionManager_DisconnectInactive(t *testing.T) {
 	decision, _, _ = nc.makeTrafficDecision(hostinfo.localIndexId, now.Add(time.Minute*10))
 	assert.Equal(t, closeTunnel, decision)
 	assert.Equal(t, now, hostinfo.lastUsed)
-	assert.False(t, hostinfo.pendingDeletion.Load())
-	assert.False(t, hostinfo.out.Load())
-	assert.False(t, hostinfo.in.Load())
+	assert.False(t, hostinfo.isPendingDeletion())
+	assert.False(t, hostinfo.sentSinceCheck())
+	assert.False(t, (hostinfo.state.Load()&stateIn != 0))
 	assert.Contains(t, nc.hostMap.Indexes, hostinfo.localIndexId)
 	assert.Contains(t, nc.hostMap.Hosts, hostinfo.vpnAddrs[0])
 }
@@ -339,15 +413,15 @@ func Test_NewConnectionManagerTest_DisconnectInvalid(t *testing.T) {
 	cachedPeerCert, err := ncp.VerifyCertificate(now.Add(time.Second), peerCert)
 
 	cs := &CertState{
-		privateKey:       []byte{},
-		v1Cert:           &dummyCert{},
-		v1HandshakeBytes: []byte{},
+		privateKey:   []byte{},
+		v1Cert:       &dummyCert{},
+		v1Credential: nil,
 	}
 
 	lh := newTestLighthouse()
 	ifce := &Interface{
 		hostMap:          hostMap,
-		inside:           &test.NoopTun{},
+		inside:           &overlaytest.NoopTun{},
 		outside:          &udp.NoopConn{},
 		firewall:         &Firewall{},
 		lightHouse:       lh,
@@ -360,9 +434,9 @@ func Test_NewConnectionManagerTest_DisconnectInvalid(t *testing.T) {
 	ifce.disconnectInvalid.Store(true)
 
 	// Create manager
-	conf := config.NewC(l)
-	punchy := NewPunchyFromConfig(l, conf)
-	nc := newConnectionManagerFromConfig(l, conf, hostMap, punchy)
+	conf := config.NewC(test.NewLogger())
+	punchy := NewPunchyFromConfig(test.NewLogger(), conf, nil)
+	nc := newConnectionManagerFromConfig(test.NewLogger(), conf, hostMap, punchy)
 	nc.intf = ifce
 	ifce.connectionManager = nc
 
@@ -371,7 +445,6 @@ func Test_NewConnectionManagerTest_DisconnectInvalid(t *testing.T) {
 		ConnectionState: &ConnectionState{
 			myCert:   &dummyCert{},
 			peerCert: cachedPeerCert,
-			H:        &noise.HandshakeState{},
 		},
 	}
 	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)

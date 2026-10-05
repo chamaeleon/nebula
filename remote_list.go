@@ -2,6 +2,7 @@ package nebula
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
@@ -10,8 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // forEachFunc is used to benefit folks that want to do work inside the lock
@@ -66,11 +65,11 @@ type hostnamesResults struct {
 	network       string
 	lookupTimeout time.Duration
 	cancelFn      func()
-	l             *logrus.Logger
+	l             *slog.Logger
 	ips           atomic.Pointer[map[netip.AddrPort]struct{}]
 }
 
-func NewHostnameResults(ctx context.Context, l *logrus.Logger, d time.Duration, network string, timeout time.Duration, hostPorts []string, onUpdate func()) (*hostnamesResults, error) {
+func NewHostnameResults(ctx context.Context, l *slog.Logger, d time.Duration, network string, timeout time.Duration, hostPorts []string, onUpdate func()) (*hostnamesResults, error) {
 	r := &hostnamesResults{
 		hostnames:     make([]hostnamePort, len(hostPorts)),
 		network:       network,
@@ -121,7 +120,11 @@ func NewHostnameResults(ctx context.Context, l *logrus.Logger, d time.Duration, 
 					addrs, err := net.DefaultResolver.LookupNetIP(timeoutCtx, r.network, hostPort.name)
 					timeoutCancel()
 					if err != nil {
-						l.WithFields(logrus.Fields{"hostname": hostPort.name, "network": r.network}).WithError(err).Error("DNS resolution failed for static_map host")
+						l.Error("DNS resolution failed for static_map host",
+							"hostname", hostPort.name,
+							"network", r.network,
+							"error", err,
+						)
 						continue
 					}
 					for _, a := range addrs {
@@ -145,7 +148,10 @@ func NewHostnameResults(ctx context.Context, l *logrus.Logger, d time.Duration, 
 					}
 				}
 				if different {
-					l.WithFields(logrus.Fields{"origSet": origSet, "newSet": netipAddrs}).Info("DNS results changed for host list")
+					l.Info("DNS results changed for host list",
+						"origSet", origSet,
+						"newSet", netipAddrs,
+					)
 					r.ips.Store(&netipAddrs)
 					onUpdate()
 				}
@@ -233,6 +239,31 @@ func (r *RemoteList) unlockedSetHostnamesResults(hr *hostnamesResults) {
 	r.hr = hr
 }
 
+// ResetForOwner zeros the reported address slices for the given owner and marks the addrs list dirty.
+// Any pending hostname resolution will be canceled.
+func (r *RemoteList) ResetForOwner(ownerVpnAddr netip.Addr) {
+	r.Lock()
+	defer r.Unlock()
+	r.hr.Cancel()
+	if c, ok := r.cache[ownerVpnAddr]; ok {
+		if c.v4 != nil {
+			c.v4.reported = c.v4.reported[:0]
+		}
+		if c.v6 != nil {
+			c.v6.reported = c.v6.reported[:0]
+		}
+	}
+	r.shouldRebuild = true
+}
+
+// ClearHostnameResults cancels the in-flight DNS resolver goroutine (if any) and drops the resolved IP cache.
+func (r *RemoteList) ClearHostnameResults() {
+	r.Lock()
+	defer r.Unlock()
+	r.unlockedSetHostnamesResults(nil)
+	r.shouldRebuild = true
+}
+
 // Len locks and reports the size of the deduplicated address list
 // The deduplication work may need to occur here, so you must pass preferredRanges
 func (r *RemoteList) Len(preferredRanges []netip.Prefix) int {
@@ -313,6 +344,9 @@ func (r *RemoteList) CopyCache() *CacheMap {
 			}
 
 			for _, a := range mc.v4.reported {
+				if a == nil {
+					continue
+				}
 				c.Reported = append(c.Reported, protoV4AddrPortToNetAddrPort(a))
 			}
 		}
@@ -323,6 +357,9 @@ func (r *RemoteList) CopyCache() *CacheMap {
 			}
 
 			for _, a := range mc.v6.reported {
+				if a == nil {
+					continue
+				}
 				c.Reported = append(c.Reported, protoV6AddrPortToNetAddrPort(a))
 			}
 		}
@@ -404,12 +441,7 @@ func (r *RemoteList) Rebuild(preferredRanges []netip.Prefix) {
 
 // unlockedIsBad assumes you have the write lock and checks if the remote matches any entry in the blocked address list
 func (r *RemoteList) unlockedIsBad(remote netip.AddrPort) bool {
-	for _, v := range r.badRemotes {
-		if v == remote {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(r.badRemotes, remote)
 }
 
 // unlockedSetLearnedV4 assumes you have the write lock and sets the current learned address for this owner and marks the
@@ -556,6 +588,9 @@ func (r *RemoteList) unlockedCollect() {
 			}
 
 			for _, v := range c.v4.reported {
+				if v == nil {
+					continue
+				}
 				u := protoV4AddrPortToNetAddrPort(v)
 				if !r.unlockedIsBad(u) {
 					addrs = append(addrs, u)
@@ -572,6 +607,9 @@ func (r *RemoteList) unlockedCollect() {
 			}
 
 			for _, v := range c.v6.reported {
+				if v == nil {
+					continue
+				}
 				u := protoV6AddrPortToNetAddrPort(v)
 				if !r.unlockedIsBad(u) {
 					addrs = append(addrs, u)

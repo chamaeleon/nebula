@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/fips140"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,7 +26,7 @@ func newKeygenFlags() *keygenFlags {
 	cf.set.Usage = func() {}
 	cf.outPubPath = cf.set.String("out-pub", "", "Required: path to write the public key to")
 	cf.outKeyPath = cf.set.String("out-key", "", "Required: path to write the private key to")
-	cf.curve = cf.set.String("curve", "25519", "ECDH Curve (25519, P256)")
+	cf.curve = cf.set.String("curve", defaultCurve(), "ECDH Curve (25519, P256)")
 	cf.p11url = p11Flag(cf.set)
 	return &cf
 }
@@ -42,6 +44,8 @@ func keygen(args []string, out io.Writer, errOut io.Writer) error {
 		if err = mustFlagString("out-key", cf.outKeyPath); err != nil {
 			return err
 		}
+	} else if *cf.outKeyPath != "" {
+		return newHelpErrorf("cannot set -out-key with -pkcs11")
 	}
 	if err = mustFlagString("out-pub", cf.outPubPath); err != nil {
 		return err
@@ -59,6 +63,9 @@ func keygen(args []string, out io.Writer, errOut io.Writer) error {
 	} else {
 		switch *cf.curve {
 		case "25519", "X25519", "Curve25519", "CURVE25519":
+			if fips140.Enforced() {
+				return errors.New("use of Curve25519 is not allowed in FIPS 140-only mode")
+			}
 			pub, rawPriv = x25519Keypair()
 			curve = cert.Curve_CURVE25519
 		case "P256":
@@ -67,6 +74,14 @@ func keygen(args []string, out io.Writer, errOut io.Writer) error {
 		default:
 			return fmt.Errorf("invalid curve: %s", *cf.curve)
 		}
+	}
+
+	var claims ioClaims
+	if err := reserveOutputs(&claims,
+		"out-key", *cf.outKeyPath,
+		"out-pub", *cf.outPubPath,
+	); err != nil {
+		return err
 	}
 
 	if isP11 {
@@ -82,12 +97,12 @@ func keygen(args []string, out io.Writer, errOut io.Writer) error {
 			return fmt.Errorf("error while getting public key: %w", err)
 		}
 	} else {
-		err = os.WriteFile(*cf.outKeyPath, cert.MarshalPrivateKeyToPEM(curve, rawPriv), 0600)
+		err = writeOutput(*cf.outKeyPath, cert.MarshalPrivateKeyToPEM(curve, rawPriv), 0600, out)
 		if err != nil {
 			return fmt.Errorf("error while writing out-key: %s", err)
 		}
 	}
-	err = os.WriteFile(*cf.outPubPath, cert.MarshalPublicKeyToPEM(curve, pub), 0600)
+	err = writeOutput(*cf.outPubPath, cert.MarshalPublicKeyToPEM(curve, pub), 0600, out)
 	if err != nil {
 		return fmt.Errorf("error while writing out-pub: %s", err)
 	}
@@ -102,6 +117,7 @@ func keygenSummary() string {
 func keygenHelp(out io.Writer) {
 	cf := newKeygenFlags()
 	_, _ = out.Write([]byte("Usage of " + os.Args[0] + " " + keygenSummary() + "\n"))
+	_, _ = out.Write([]byte(stdioHelpText))
 	cf.set.SetOutput(out)
 	cf.set.PrintDefaults()
 }

@@ -1,10 +1,9 @@
 //go:build !linux
-// +build !linux
 
 package main
 
-import "github.com/sirupsen/logrus"
+import "log/slog"
 
-func notifyReady(_ *logrus.Logger) {
+func notifyReady(_ *slog.Logger) {
 	// No init service to notify
 }

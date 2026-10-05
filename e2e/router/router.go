@@ -1,18 +1,20 @@
 //go:build e2e_testing
-// +build e2e_testing
 
 package router
 
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,8 +23,20 @@ import (
 	"github.com/slackhq/nebula"
 	"github.com/slackhq/nebula/header"
 	"github.com/slackhq/nebula/udp"
-	"golang.org/x/exp/maps"
 )
+
+// outNatKey is the (from, to) pair used by outNat. Comparable struct, so it works as a map key without the
+// allocation cost of a string-concat key.
+type outNatKey struct {
+	from, to netip.AddrPort
+}
+
+// fannedPacket pairs a UDP TX packet with its source control so the router can route it after popping from
+// the fan-in channel.
+type fannedPacket struct {
+	from *nebula.Control
+	pkt  *udp.Packet
+}
 
 type R struct {
 	// Simple map of the ip:port registered on a control to the control
@@ -34,11 +48,27 @@ type R struct {
 
 	// A last used map, if an inbound packet hit the inNat map then
 	// all return packets should use the same last used inbound address for the outbound sender
-	// map[from address + ":" + to address] => ip:port to rewrite in the udp packet to receiver
-	outNat map[string]netip.AddrPort
+	outNat map[outNatKey]netip.AddrPort
 
 	// A map of vpn ip to the nebula control it belongs to
 	vpnControls map[netip.Addr]*nebula.Control
+
+	// Cached select infrastructure for RouteForAllUntilTxTun.
+	// The controls map is immutable after NewR so the cases are good for the test lifetime.
+	// We only rebuild if a different receiver is asked.
+	selRecvCtl *nebula.Control
+	selCases   []reflect.SelectCase
+	selCtls    []*nebula.Control
+
+	// Optional fan-in mode for hot-path benchmarks: one forwarder goroutine per control drains UDP TX into udpFanIn,
+	// so RouteForAllUntilTxTun can do a fixed 2-way native select instead of paying reflect.Select per call.
+	// Off by default (would otherwise interleave with tests that use GetFromUDP directly on the same control).
+	// Enabled by EnableFanIn.
+	udpFanIn  chan fannedPacket
+	stopFanIn chan struct{}
+	fanInWG   sync.WaitGroup
+	fanInMu   sync.Mutex
+	fanInOn   atomic.Bool
 
 	ignoreFlows []ignoreFlow
 	flow        []flowEntry
@@ -84,6 +114,28 @@ type packet struct {
 	packet *udp.Packet
 	tun    bool // a packet pulled off a tun device
 	rx     bool // the packet was received by a udp device
+
+	// h is the nebula header, parsed once when the packet is recorded. parseErr says why there isn't one, which
+	// the flow log reports rather than hiding. Punchy sends a single byte, so an unparseable packet is normal.
+	h        header.H
+	parseErr error
+}
+
+// fromAddr and toAddr are the addresses this packet actually travelled between. Reading them off the control
+// instead would misreport the whole history once a test moves a node. Tun packets are synthesized without
+// addresses, so they fall back to the control.
+func (p *packet) fromAddr() netip.AddrPort {
+	if p.tun || !p.packet.From.IsValid() {
+		return p.from.GetUDPAddr()
+	}
+	return p.packet.From
+}
+
+func (p *packet) toAddr() netip.AddrPort {
+	if p.tun || !p.packet.To.IsValid() {
+		return p.to.GetUDPAddr()
+	}
+	return p.packet.To
 }
 
 func (p *packet) WasReceived() {
@@ -101,6 +153,9 @@ const (
 	ExitNow ExitType = 1
 	// RouteAndExit routes this packet and exits immediately afterwards
 	RouteAndExit ExitType = 2
+	// Drop discards this packet without delivering it and keeps routing. Use it to simulate a blackhole, such as
+	// a restrictive NAT refusing traffic from an address it has not seen.
+	Drop ExitType = 3
 )
 
 type ExitFunc func(packet *udp.Packet, receiver *nebula.Control) ExitType
@@ -111,7 +166,9 @@ type ExitFunc func(packet *udp.Packet, receiver *nebula.Control) ExitType
 func NewR(t testing.TB, controls ...*nebula.Control) *R {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	if err := os.MkdirAll("mermaid", 0755); err != nil {
+	// t.Name() contains a slash for subtests, so the flow log can land in a nested directory
+	fn := filepath.Join("mermaid", fmt.Sprintf("%s.md", t.Name()))
+	if err := os.MkdirAll(filepath.Dir(fn), 0755); err != nil {
 		panic(err)
 	}
 
@@ -119,10 +176,10 @@ func NewR(t testing.TB, controls ...*nebula.Control) *R {
 		controls:     make(map[netip.AddrPort]*nebula.Control),
 		vpnControls:  make(map[netip.Addr]*nebula.Control),
 		inNat:        make(map[netip.AddrPort]*nebula.Control),
-		outNat:       make(map[string]netip.AddrPort),
+		outNat:       make(map[outNatKey]netip.AddrPort),
 		flow:         []flowEntry{},
 		ignoreFlows:  []ignoreFlow{},
-		fn:           filepath.Join("mermaid", fmt.Sprintf("%s.md", t.Name())),
+		fn:           fn,
 		t:            t,
 		cancelRender: cancel,
 	}
@@ -153,8 +210,10 @@ func NewR(t testing.TB, controls ...*nebula.Control) *R {
 			case <-ctx.Done():
 				return
 			case <-clockSource.C:
+				r.Lock()
 				r.renderHostmaps("clock tick")
 				r.renderFlow()
+				r.Unlock()
 			}
 		}
 	}()
@@ -180,15 +239,21 @@ func (r *R) AddRoute(ip netip.Addr, port uint16, c *nebula.Control) {
 // RenderFlow renders the packet flow seen up until now and stops further automatic renders from happening.
 func (r *R) RenderFlow() {
 	r.cancelRender()
+	r.Lock()
+	defer r.Unlock()
 	r.renderFlow()
 }
 
 // CancelFlowLogs stops flow logs from being tracked and destroys any logs already collected
 func (r *R) CancelFlowLogs() {
 	r.cancelRender()
+	r.Lock()
 	r.flow = nil
+	r.Unlock()
 }
 
+// renderFlow writes the flow log to disk. Caller must hold r.Lock. renderFlow reads r.flow / r.additionalGraphs and
+// the *packet pointers stashed inside, all of which are mutated under the same lock by routing paths.
 func (r *R) renderFlow() {
 	if r.flow == nil {
 		return
@@ -211,7 +276,7 @@ func (r *R) renderFlow() {
 			continue
 		}
 
-		addr := e.packet.from.GetUDPAddr()
+		addr := e.packet.fromAddr()
 		if _, ok := participants[addr]; ok {
 			continue
 		}
@@ -230,7 +295,6 @@ func (r *R) renderFlow() {
 	}
 
 	// Print packets
-	h := &header.H{}
 	for _, e := range r.flow {
 		if e.packet == nil {
 			//fmt.Fprintf(f, "    note over %s: %s\n", strings.Join(participantsVals, ", "), e.note)
@@ -242,21 +306,22 @@ func (r *R) renderFlow() {
 			fmt.Fprintln(f, r.formatUdpPacket(p))
 
 		} else {
-			if err := h.Parse(p.packet.Data); err != nil {
-				panic(err)
-			}
-
 			line := "--x"
 			if p.rx {
 				line = "->>"
 			}
 
-			fmt.Fprintf(f,
-				"    %s%s%s: %s(%s), index %v, counter: %v\n",
-				normalizeName(p.from.GetUDPAddr().String()),
+			detail := fmt.Sprintf("%s(%s), index %v, counter: %v",
+				p.h.TypeName(), p.h.SubTypeName(), p.h.RemoteIndex, p.h.MessageCounter)
+			if p.parseErr != nil {
+				detail = fmt.Sprintf("unparsed, %v (%d bytes)", p.parseErr, len(p.packet.Data))
+			}
+
+			fmt.Fprintf(f, "    %s%s%s: %s\n",
+				normalizeName(p.fromAddr().String()),
 				line,
-				normalizeName(p.to.GetUDPAddr().String()),
-				h.TypeName(), h.SubTypeName(), h.RemoteIndex, h.MessageCounter,
+				normalizeName(p.toAddr().String()),
+				detail,
 			)
 		}
 	}
@@ -309,7 +374,7 @@ func (r *R) RenderHostmaps(title string, controls ...*nebula.Control) {
 }
 
 func (r *R) renderHostmaps(title string) {
-	c := maps.Values(r.controls)
+	c := slices.AppendSeq(make([]*nebula.Control, 0, len(r.controls)), maps.Values(r.controls))
 	sort.SliceStable(c, func(i, j int) bool {
 		return c[i].GetVpnAddrs()[0].Compare(c[j].GetVpnAddrs()[0]) > 0
 	})
@@ -370,29 +435,34 @@ func (r *R) unlockedInjectFlow(from, to *nebula.Control, p *udp.Packet, tun bool
 
 	r.renderHostmaps(fmt.Sprintf("Packet %v", len(r.flow)))
 
-	if len(r.ignoreFlows) > 0 {
-		var h header.H
-		err := h.Parse(p.Data)
-		if err != nil {
-			panic(err)
-		}
+	var h header.H
+	var parseErr error
+	if !tun {
+		parseErr = h.Parse(p.Data)
+	}
 
-		for _, i := range r.ignoreFlows {
-			if !tun {
-				if i.messageType == h.Type && i.subType == h.Subtype {
-					return nil
-				}
-			} else if i.tun.HasValue && i.tun.IsTrue {
+	// Decide before copying, the copy comes from a freelist and an ignored packet would never be released
+	for _, i := range r.ignoreFlows {
+		if tun {
+			if i.tun.HasValue && i.tun.IsTrue {
 				return nil
 			}
+			continue
+		}
+
+		// A packet we could not parse has no type to match against, so no rule can ignore it
+		if parseErr == nil && i.messageType == h.Type && i.subType == h.Subtype {
+			return nil
 		}
 	}
 
 	fp := &packet{
-		from:   from,
-		to:     to,
-		packet: p.Copy(),
-		tun:    tun,
+		from:     from,
+		to:       to,
+		packet:   p.Copy(),
+		tun:      tun,
+		h:        h,
+		parseErr: parseErr,
 	}
 
 	r.flow = append(r.flow, flowEntry{packet: fp})
@@ -434,68 +504,157 @@ func (r *R) RouteUntilTxTun(sender *nebula.Control, receiver *nebula.Control) []
 				panic("No control for udp tx " + a.String())
 			}
 			fp := r.unlockedInjectFlow(sender, c, p, false)
-			c.InjectUDPPacket(p)
+			c.InjectUDPPacket(p) // copies internally; original is ours to release
 			fp.WasReceived()
 			r.Unlock()
+			p.Release()
 		}
 	}
 }
 
-// RouteForAllUntilTxTun will route for everyone and return when a packet is seen on receivers tun
-// If the router doesn't have the nebula controller for that address, we panic
+// RouteForAllUntilTxTun will route for everyone and return when a packet is seen on the receiver's tun.
+// If a control's UDP TX address can't be matched to a registered control, we panic.
+//
+// For allocation-sensitive callers (hot-path benchmarks, in particular relay
+// benches with 3+ controls), call EnableFanIn() first.
 func (r *R) RouteForAllUntilTxTun(receiver *nebula.Control) []byte {
+	if r.fanInOn.Load() {
+		return r.routeFanIn(receiver)
+	}
+	return r.routeReflect(receiver)
+}
+
+// routeFanIn is the alloc-free path used when EnableFanIn is in effect.
+func (r *R) routeFanIn(receiver *nebula.Control) []byte {
+	tunTx := receiver.GetTunTxChan()
+	for {
+		select {
+		case p := <-tunTx:
+			r.Lock()
+			if r.flow != nil {
+				np := udp.Packet{Data: make([]byte, len(p))}
+				copy(np.Data, p)
+				r.unlockedInjectFlow(receiver, receiver, &np, true)
+			}
+			r.Unlock()
+			return p
+		case fp := <-r.udpFanIn:
+			r.routeUDP(fp.from, fp.pkt)
+		}
+	}
+}
+
+// routeReflect is the default reflect.Select-based path. Pays the boxing allocation per call but doesn't interfere
+// with tests that pull packets directly from controls' UDP TX channels via GetFromUDP.
+func (r *R) routeReflect(receiver *nebula.Control) []byte {
+	sc, cm := r.selectCasesFor(receiver)
+	for {
+		x, rx, _ := reflect.Select(sc)
+		if x == 0 {
+			p := rx.Interface().([]byte)
+			r.Lock()
+			if r.flow != nil {
+				np := udp.Packet{Data: make([]byte, len(p))}
+				copy(np.Data, p)
+				r.unlockedInjectFlow(cm[x], cm[x], &np, true)
+			}
+			r.Unlock()
+			return p
+		}
+		r.routeUDP(cm[x], rx.Interface().(*udp.Packet))
+	}
+}
+
+// EnableFanIn switches RouteForAllUntilTxTun to the alloc-free fan-in path.
+// One forwarder goroutine per registered control drains UDP TX into a shared channel that RouteForAllUntilTxTun selects
+// on alongside the receiver's TUN TX channel.
+func (r *R) EnableFanIn() {
+	r.fanInMu.Lock()
+	defer r.fanInMu.Unlock()
+	if r.fanInOn.Load() {
+		return
+	}
+	r.udpFanIn = make(chan fannedPacket, 32)
+	r.stopFanIn = make(chan struct{})
+	for _, c := range r.controls {
+		r.startFanInWorker(c)
+	}
+	r.fanInOn.Store(true)
+	r.t.Cleanup(r.stopFanInWorkers)
+}
+
+// startFanInWorker spawns a goroutine that drains c's UDP TX into r.udpFanIn.
+func (r *R) startFanInWorker(c *nebula.Control) {
+	r.fanInWG.Add(1)
+	udpTx := c.GetUDPTxChan()
+	go func() {
+		defer r.fanInWG.Done()
+		for {
+			select {
+			case <-r.stopFanIn:
+				return
+			case p := <-udpTx:
+				select {
+				case <-r.stopFanIn:
+					p.Release()
+					return
+				case r.udpFanIn <- fannedPacket{from: c, pkt: p}:
+				}
+			}
+		}
+	}()
+}
+
+// stopFanInWorkers signals the fan-in goroutines to exit and waits for them.
+func (r *R) stopFanInWorkers() {
+	r.fanInMu.Lock()
+	wasOn := r.fanInOn.Swap(false)
+	r.fanInMu.Unlock()
+	if !wasOn {
+		return
+	}
+	close(r.stopFanIn)
+	r.fanInWG.Wait()
+}
+
+// routeUDP forwards a UDP TX packet from the named source control to the destination control derived from p.To,
+// releasing the source packet after InjectUDPPacket has copied its bytes into a fresh pool slot.
+func (r *R) routeUDP(from *nebula.Control, p *udp.Packet) {
+	r.Lock()
+	defer r.Unlock()
+	a := from.GetUDPAddr()
+	c := r.getControl(a, p.To, p)
+	if c == nil {
+		panic(fmt.Sprintf("No control for udp tx %s", p.To))
+	}
+	fp := r.unlockedInjectFlow(from, c, p, false)
+	c.InjectUDPPacket(p) // copies internally; original is ours to release
+	fp.WasReceived()
+	p.Release()
+}
+
+// selectCasesFor returns the SelectCase array used by routeReflect: one slot for the receiver's TUN TX channel followed
+// by one per control's UDP TX channel. Cached for the test lifetime, only rebuilt if the receiver changes.
+func (r *R) selectCasesFor(receiver *nebula.Control) ([]reflect.SelectCase, []*nebula.Control) {
+	r.Lock()
+	defer r.Unlock()
+	if r.selRecvCtl == receiver && r.selCases != nil {
+		return r.selCases, r.selCtls
+	}
 	sc := make([]reflect.SelectCase, len(r.controls)+1)
 	cm := make([]*nebula.Control, len(r.controls)+1)
-
-	i := 0
-	sc[i] = reflect.SelectCase{
-		Dir:  reflect.SelectRecv,
-		Chan: reflect.ValueOf(receiver.GetTunTxChan()),
-		Send: reflect.Value{},
-	}
-	cm[i] = receiver
-
-	i++
+	sc[0] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(receiver.GetTunTxChan())}
+	cm[0] = receiver
+	i := 1
 	for _, c := range r.controls {
-		sc[i] = reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(c.GetUDPTxChan()),
-			Send: reflect.Value{},
-		}
-
+		sc[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c.GetUDPTxChan())}
 		cm[i] = c
 		i++
 	}
-
-	for {
-		x, rx, _ := reflect.Select(sc)
-		r.Lock()
-
-		if x == 0 {
-			// we are the tun tx, we can exit
-			p := rx.Interface().([]byte)
-			np := udp.Packet{Data: make([]byte, len(p))}
-			copy(np.Data, p)
-
-			r.unlockedInjectFlow(cm[x], cm[x], &np, true)
-			r.Unlock()
-			return p
-
-		} else {
-			// we are a udp tx, route and continue
-			p := rx.Interface().(*udp.Packet)
-			a := cm[x].GetUDPAddr()
-			c := r.getControl(a, p.To, p)
-			if c == nil {
-				r.Unlock()
-				panic(fmt.Sprintf("No control for udp tx %s", p.To))
-			}
-			fp := r.unlockedInjectFlow(cm[x], c, p, false)
-			c.InjectUDPPacket(p)
-			fp.WasReceived()
-		}
-		r.Unlock()
-	}
+	r.selRecvCtl = receiver
+	r.selCases = sc
+	r.selCtls = cm
+	return sc, cm
 }
 
 // RouteExitFunc will call the whatDo func with each udp packet from sender.
@@ -522,6 +681,7 @@ func (r *R) RouteExitFunc(sender *nebula.Control, whatDo ExitFunc) {
 		switch e {
 		case ExitNow:
 			r.Unlock()
+			p.Release()
 			return
 
 		case RouteAndExit:
@@ -529,7 +689,12 @@ func (r *R) RouteExitFunc(sender *nebula.Control, whatDo ExitFunc) {
 			receiver.InjectUDPPacket(p)
 			fp.WasReceived()
 			r.Unlock()
+			p.Release()
 			return
+
+		case Drop:
+			// Record it so the flow log shows the attempt, but never hand it to the receiver
+			r.unlockedInjectFlow(sender, receiver, p, false)
 
 		case KeepRouting:
 			fp := r.unlockedInjectFlow(sender, receiver, p, false)
@@ -541,6 +706,7 @@ func (r *R) RouteExitFunc(sender *nebula.Control, whatDo ExitFunc) {
 		}
 
 		r.Unlock()
+		p.Release()
 	}
 }
 
@@ -558,6 +724,85 @@ func (r *R) RouteUntilAfterMsgType(sender *nebula.Control, msgType header.Messag
 
 		return KeepRouting
 	})
+}
+
+// RouteFor routes everything that shows up for the given duration and then returns. Use it to let a test settle
+// deterministically rather than sleeping and hoping: a single FlushAll races a completing handshake, which queues
+// more packets right behind it.
+func (r *R) RouteFor(d time.Duration) {
+	r.RouteForAllExitFuncOrTimeout(d, func(*udp.Packet, *nebula.Control) ExitType {
+		return KeepRouting
+	})
+}
+
+// RouteForAllExitFuncOrTimeout is RouteForAllExitFunc with a deadline, reporting whether whatDo asked to exit
+// before time ran out. The unbounded version blocks forever on a quiet network, so this is what a test needs to
+// assert that something does NOT happen, or to route for a fixed settling period.
+func (r *R) RouteForAllExitFuncOrTimeout(timeout time.Duration, whatDo ExitFunc) bool {
+	sc := make([]reflect.SelectCase, 0, len(r.controls)+1)
+	cm := make([]*nebula.Control, 0, len(r.controls))
+
+	for _, c := range r.controls {
+		sc = append(sc, reflect.SelectCase{
+			Dir:  reflect.SelectRecv,
+			Chan: reflect.ValueOf(c.GetUDPTxChan()),
+			Send: reflect.Value{},
+		})
+		cm = append(cm, c)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	sc = append(sc, reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(timer.C),
+		Send: reflect.Value{},
+	})
+
+	for {
+		x, rx, _ := reflect.Select(sc)
+		if x == len(cm) {
+			return false
+		}
+
+		r.Lock()
+		p := rx.Interface().(*udp.Packet)
+		receiver := r.getControl(cm[x].GetUDPAddr(), p.To, p)
+		if receiver == nil {
+			r.Unlock()
+			panic("Can't RouteForAllExitFuncOrTimeout for host: " + p.To.String())
+		}
+
+		e := whatDo(p, receiver)
+		switch e {
+		case ExitNow:
+			r.Unlock()
+			p.Release()
+			return true
+
+		case RouteAndExit:
+			fp := r.unlockedInjectFlow(cm[x], receiver, p, false)
+			receiver.InjectUDPPacket(p)
+			fp.WasReceived()
+			r.Unlock()
+			p.Release()
+			return true
+
+		case Drop:
+			// Record it so the flow log shows the attempt, but never hand it to the receiver
+			r.unlockedInjectFlow(cm[x], receiver, p, false)
+
+		case KeepRouting:
+			fp := r.unlockedInjectFlow(cm[x], receiver, p, false)
+			receiver.InjectUDPPacket(p)
+			fp.WasReceived()
+
+		default:
+			panic(fmt.Sprintf("Unknown exitFunc return: %v", e))
+		}
+		r.Unlock()
+		p.Release()
+	}
 }
 
 func (r *R) RouteForAllUntilAfterMsgTypeTo(receiver *nebula.Control, msgType header.MessageType, subType header.MessageSubType) {
@@ -641,6 +886,7 @@ func (r *R) RouteForAllExitFunc(whatDo ExitFunc) {
 		switch e {
 		case ExitNow:
 			r.Unlock()
+			p.Release()
 			return
 
 		case RouteAndExit:
@@ -648,7 +894,12 @@ func (r *R) RouteForAllExitFunc(whatDo ExitFunc) {
 			receiver.InjectUDPPacket(p)
 			fp.WasReceived()
 			r.Unlock()
+			p.Release()
 			return
+
+		case Drop:
+			// Record it so the flow log shows the attempt, but never hand it to the receiver
+			r.unlockedInjectFlow(cm[x], receiver, p, false)
 
 		case KeepRouting:
 			fp := r.unlockedInjectFlow(cm[x], receiver, p, false)
@@ -659,6 +910,7 @@ func (r *R) RouteForAllExitFunc(whatDo ExitFunc) {
 			panic(fmt.Sprintf("Unknown exitFunc return: %v", e))
 		}
 		r.Unlock()
+		p.Release()
 	}
 }
 
@@ -702,19 +954,20 @@ func (r *R) FlushAll() {
 		}
 		receiver.InjectUDPPacket(p)
 		r.Unlock()
+		p.Release()
 	}
 }
 
 // getControl performs or seeds NAT translation and returns the control for toAddr, p from fields may change
 // This is an internal router function, the caller must hold the lock
 func (r *R) getControl(fromAddr, toAddr netip.AddrPort, p *udp.Packet) *nebula.Control {
-	if newAddr, ok := r.outNat[fromAddr.String()+":"+toAddr.String()]; ok {
+	if newAddr, ok := r.outNat[outNatKey{from: fromAddr, to: toAddr}]; ok {
 		p.From = newAddr
 	}
 
 	c, ok := r.inNat[toAddr]
 	if ok {
-		r.outNat[c.GetUDPAddr().String()+":"+fromAddr.String()] = toAddr
+		r.outNat[outNatKey{from: c.GetUDPAddr(), to: fromAddr}] = toAddr
 		return c
 	}
 

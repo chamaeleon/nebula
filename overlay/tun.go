@@ -2,20 +2,29 @@ package overlay
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
 	"github.com/slackhq/nebula/util"
 )
 
 const DefaultMTU = 1300
 
-// TODO: We may be able to remove routines
-type DeviceFactory func(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, routines int) (Device, error)
+type NameError struct {
+	Name       string
+	Underlying error
+}
 
-func NewDeviceFromConfig(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, routines int) (Device, error) {
+func (e *NameError) Error() string {
+	return fmt.Sprintf("could not set tun device name: %s because %s", e.Name, e.Underlying)
+}
+
+// TODO: We may be able to remove routines
+type DeviceFactory func(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, routines int) (Device, error)
+
+func NewDeviceFromConfig(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, routines int) (Device, error) {
 	switch {
 	case c.GetBool("tun.disabled", false):
 		tun := newDisabledTun(vpnNetworks, c.GetInt("tun.tx_queue", 500), c.GetBool("stats.message_metrics", false), l)
@@ -27,7 +36,7 @@ func NewDeviceFromConfig(c *config.C, l *logrus.Logger, vpnNetworks []netip.Pref
 }
 
 func NewFdDeviceFromConfig(fd *int) DeviceFactory {
-	return func(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, routines int) (Device, error) {
+	return func(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, routines int) (Device, error) {
 		return newTunFromFd(c, l, *fd, vpnNetworks)
 	}
 }
@@ -84,14 +93,14 @@ func prefixToMask(prefix netip.Prefix) netip.Addr {
 }
 
 func flipBytes(b []byte) []byte {
-	for i := 0; i < len(b); i++ {
+	for i := range b {
 		b[i] ^= 0xFF
 	}
 	return b
 }
 func orBytes(a []byte, b []byte) []byte {
 	ret := make([]byte, len(a))
-	for i := 0; i < len(a); i++ {
+	for i := range a {
 		ret[i] = a[i] | b[i]
 	}
 	return ret

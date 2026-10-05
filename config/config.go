@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"os/signal"
@@ -16,7 +18,6 @@ import (
 	"time"
 
 	"dario.cat/mergo"
-	"github.com/sirupsen/logrus"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -26,11 +27,11 @@ type C struct {
 	Settings    map[string]any
 	oldSettings map[string]any
 	callbacks   []func(*C)
-	l           *logrus.Logger
+	l           *slog.Logger
 	reloadLock  sync.Mutex
 }
 
-func NewC(l *logrus.Logger) *C {
+func NewC(l *slog.Logger) *C {
 	return &C{
 		Settings: make(map[string]any),
 		l:        l,
@@ -107,12 +108,18 @@ func (c *C) HasChanged(k string) bool {
 
 	newVals, err := yaml.Marshal(nv)
 	if err != nil {
-		c.l.WithField("config_path", k).WithError(err).Error("Error while marshaling new config")
+		c.l.Error("Error while marshaling new config",
+			"config_path", k,
+			"error", err,
+		)
 	}
 
 	oldVals, err := yaml.Marshal(ov)
 	if err != nil {
-		c.l.WithField("config_path", k).WithError(err).Error("Error while marshaling old config")
+		c.l.Error("Error while marshaling old config",
+			"config_path", k,
+			"error", err,
+		)
 	}
 
 	return string(newVals) != string(oldVals)
@@ -148,13 +155,14 @@ func (c *C) ReloadConfig() {
 	defer c.reloadLock.Unlock()
 
 	c.oldSettings = make(map[string]any)
-	for k, v := range c.Settings {
-		c.oldSettings[k] = v
-	}
+	maps.Copy(c.oldSettings, c.Settings)
 
 	err := c.Load(c.path)
 	if err != nil {
-		c.l.WithField("config_path", c.path).WithError(err).Error("Error occurred while reloading config")
+		c.l.Error("Error occurred while reloading config",
+			"config_path", c.path,
+			"error", err,
+		)
 		return
 	}
 
@@ -168,9 +176,7 @@ func (c *C) ReloadConfigString(raw string) error {
 	defer c.reloadLock.Unlock()
 
 	c.oldSettings = make(map[string]any)
-	for k, v := range c.Settings {
-		c.oldSettings[k] = v
-	}
+	maps.Copy(c.oldSettings, c.Settings)
 
 	err := c.LoadString(raw)
 	if err != nil {
@@ -207,7 +213,7 @@ func (c *C) GetStringSlice(k string, d []string) []string {
 	}
 
 	v := make([]string, len(rv))
-	for i := 0; i < len(v); i++ {
+	for i := range v {
 		v[i] = fmt.Sprintf("%v", rv[i])
 	}
 
@@ -301,8 +307,8 @@ func (c *C) IsSet(k string) bool {
 }
 
 func (c *C) get(k string, v any) any {
-	parts := strings.Split(k, ".")
-	for _, p := range parts {
+	parts := strings.SplitSeq(k, ".")
+	for p := range parts {
 		m, ok := v.(map[string]any)
 		if !ok {
 			return nil

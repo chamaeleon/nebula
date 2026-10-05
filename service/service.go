@@ -43,8 +43,24 @@ type Service struct {
 	}
 }
 
-func New(control *nebula.Control) (*Service, error) {
-	control.Start()
+func New(control *nebula.Control) (_ *Service, reterr error) {
+	// Check this before Start so a failure doesn't leave a running nebula
+	device, ok := control.Device().(*overlay.UserDevice)
+	if !ok {
+		return nil, errors.New("must be using user device")
+	}
+
+	err := control.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	// Anything that fails after a successful Start must tear nebula back down
+	defer func() {
+		if reterr != nil {
+			control.Stop()
+		}
+	}()
 
 	ctx := control.Context()
 	eg, ctx := errgroup.WithContext(ctx)
@@ -53,11 +69,6 @@ func New(control *nebula.Control) (*Service, error) {
 		control: control,
 	}
 	s.mu.listeners = map[uint16]*tcpListener{}
-
-	device, ok := control.Device().(*overlay.UserDevice)
-	if !ok {
-		return nil, errors.New("must be using user device")
-	}
 
 	s.ipstack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
@@ -139,6 +150,12 @@ func New(control *nebula.Control) (*Service, error) {
 			}
 			bufView.Release()
 		}
+	})
+
+	// Add the nebula wait function to the group so a fatal reader error
+	// propagates out through errgroup.Wait().
+	eg.Go(func() error {
+		return control.Wait()
 	})
 
 	return &s, nil

@@ -1,12 +1,11 @@
 //go:build !ios && !e2e_testing
-// +build !ios,!e2e_testing
 
 package overlay
 
 import (
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"net/netip"
 	"os"
 	"sync/atomic"
@@ -14,8 +13,8 @@ import (
 	"unsafe"
 
 	"github.com/gaissmai/bart"
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/routing"
 	"github.com/slackhq/nebula/util"
 	netroute "golang.org/x/net/route"
@@ -23,17 +22,17 @@ import (
 )
 
 type tun struct {
-	io.ReadWriteCloser
+	f           *os.File
 	Device      string
 	vpnNetworks []netip.Prefix
 	DefaultMTU  int
 	Routes      atomic.Pointer[[]Route]
 	routeTree   atomic.Pointer[bart.Table[routing.Gateways]]
 	linkAddr    *netroute.LinkAddr
-	l           *logrus.Logger
-
-	// cache out buffer since we need to prepend 4 bytes for tun metadata
-	out []byte
+	// hostOwned means the fd arrived from the OS, which has already configured addressing, mtu
+	// and routes for it. NEPacketTunnelProvider on darwin does this.
+	hostOwned bool
+	l         *slog.Logger
 }
 
 type ifReq struct {
@@ -79,7 +78,7 @@ type ifreqAlias6 struct {
 	Lifetime   addrLifetime
 }
 
-func newTun(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, _ bool) (*tun, error) {
+func newTun(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, _ bool) (*tun, error) {
 	name := c.GetString("tun.dev", "")
 	ifIndex := -1
 	if name != "" && name != "utun" {
@@ -124,11 +123,11 @@ func newTun(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, _ bool) (
 	}
 
 	t := &tun{
-		ReadWriteCloser: os.NewFile(uintptr(fd), ""),
-		Device:          name,
-		vpnNetworks:     vpnNetworks,
-		DefaultMTU:      c.GetInt("tun.mtu", DefaultMTU),
-		l:               l,
+		f:           os.NewFile(uintptr(fd), ""),
+		Device:      name,
+		vpnNetworks: vpnNetworks,
+		DefaultMTU:  c.GetInt("tun.mtu", DefaultMTU),
+		l:           l,
 	}
 
 	err = t.reload(c, true)
@@ -153,18 +152,64 @@ func (t *tun) deviceBytes() (o [16]byte) {
 	return
 }
 
-func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ []netip.Prefix) (*tun, error) {
-	return nil, fmt.Errorf("newTunFromFd not supported in Darwin")
+// newTunFromFd adopts a utun the host already created and configured, which is how a darwin
+// network extension is handed its device. Everything about moving packets is shared with newTun,
+// only the setup differs: the host owns addressing and routing here.
+func newTunFromFd(c *config.C, l *slog.Logger, deviceFd int, vpnNetworks []netip.Prefix) (*tun, error) {
+	if err := unix.SetNonblock(deviceFd, true); err != nil {
+		// We own the fd from the moment it is handed to us
+		_ = unix.Close(deviceFd)
+		return nil, fmt.Errorf("failed to set the tun fd to non-blocking mode: %w", err)
+	}
+
+	file := os.NewFile(uintptr(deviceFd), "/dev/tun")
+	t := &tun{
+		f:           file,
+		Device:      utunNameFromFd(deviceFd),
+		vpnNetworks: vpnNetworks,
+		DefaultMTU:  c.GetInt("tun.mtu", DefaultMTU),
+		hostOwned:   true,
+		l:           l,
+	}
+
+	if err := t.reload(c, true); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+
+	c.RegisterReloadCallback(func(c *config.C) {
+		if err := t.reload(c, false); err != nil {
+			util.LogWithContextIfNeeded("failed to reload tun device", err, t.l)
+		}
+	})
+
+	return t, nil
+}
+
+// utunNameFromFd asks the socket what interface it is, for logs. A blank name is not worth
+// failing a tunnel over, so an error just leaves it empty.
+func utunNameFromFd(fd int) string {
+	name, err := unix.GetsockoptString(fd, unix.AF_SYS_CONTROL, _UTUN_OPT_IFNAME)
+	if err != nil {
+		return ""
+	}
+	return name
 }
 
 func (t *tun) Close() error {
-	if t.ReadWriteCloser != nil {
-		return t.ReadWriteCloser.Close()
+	if t.f != nil {
+		return t.f.Close()
 	}
 	return nil
 }
 
 func (t *tun) Activate() error {
+	// The host handed us a configured device. Its addresses, mtu and routes come from the network
+	// settings it applied, and a sandboxed extension cannot change them anyway.
+	if t.hostOwned {
+		return nil
+	}
+
 	devName := t.deviceBytes()
 
 	s, err := unix.Socket(
@@ -378,6 +423,11 @@ func getLinkAddr(name string) (*netroute.LinkAddr, error) {
 }
 
 func (t *tun) addRoutes(logErrors bool) error {
+	// The route tree is still ours, the system routing table is not
+	if t.hostOwned {
+		return nil
+	}
+
 	routes := *t.Routes.Load()
 
 	for _, r := range routes {
@@ -389,8 +439,7 @@ func (t *tun) addRoutes(logErrors bool) error {
 		err := addRoute(r.Cidr, t.linkAddr)
 		if err != nil {
 			if errors.Is(err, unix.EEXIST) {
-				t.l.WithField("route", r.Cidr).
-					Warnf("unable to add unsafe_route, identical route already exists")
+				t.l.Warn("unable to add unsafe_route, identical route already exists", "route", r.Cidr)
 			} else {
 				retErr := util.NewContextualError("Failed to add route", map[string]any{"route": r}, err)
 				if logErrors {
@@ -400,7 +449,7 @@ func (t *tun) addRoutes(logErrors bool) error {
 				}
 			}
 		} else {
-			t.l.WithField("route", r).Info("Added route")
+			t.l.Info("Added route", "route", r)
 		}
 	}
 
@@ -408,6 +457,10 @@ func (t *tun) addRoutes(logErrors bool) error {
 }
 
 func (t *tun) removeRoutes(routes []Route) error {
+	if t.hostOwned {
+		return nil
+	}
+
 	for _, r := range routes {
 		if !r.Install {
 			continue
@@ -415,9 +468,9 @@ func (t *tun) removeRoutes(routes []Route) error {
 
 		err := delRoute(r.Cidr, t.linkAddr)
 		if err != nil {
-			t.l.WithError(err).WithField("route", r).Error("Failed to remove route")
+			t.l.Error("Failed to remove route", "error", err, "route", r)
 		} else {
-			t.l.WithField("route", r).Info("Removed route")
+			t.l.Info("Removed route", "route", r)
 		}
 	}
 	return nil
@@ -503,42 +556,105 @@ func delRoute(prefix netip.Prefix, gateway netroute.Addr) error {
 	return nil
 }
 
+// tunWritev and tunReadv are linkname'd to x/sys/unix's libc-routed writev/readv stubs so the
+// calls go through libSystem's pinned trampoline. A raw syscall.Syscall(SYS_WRITEV/SYS_READV, ...)
+// on darwin/arm64 emits an SVC #0x80 trap (see $GOROOT/src/syscall/asm_darwin_arm64.s), the path
+// Apple keeps warning they will eventually disallow. We pull the low-level stubs instead of calling
+// unix.Writev/unix.Readv because those take [][]byte and rebuild the []Iovec every call, which
+// heap-allocates the header; linkname'ing the stubs lets us hand them our own stack-allocated
+// iovecs. See golang/go#78049.
+
+//go:linkname tunWritev golang.org/x/sys/unix.writev
+//go:noescape
+func tunWritev(fd int, iovecs []unix.Iovec) (n int, err error)
+
+//go:linkname tunReadv golang.org/x/sys/unix.readv
+//go:noescape
+func tunReadv(fd int, iovecs []unix.Iovec) (n int, err error)
+
+// Read pulls one IP packet off the utun device, scattering the 4 byte protocol header away from
+// the packet so the payload lands directly in to.
 func (t *tun) Read(to []byte) (int, error) {
-	buf := make([]byte, len(to)+4)
+	var head [4]byte
 
-	n, err := t.ReadWriteCloser.Read(buf)
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
 
-	copy(to, buf[4:])
-	return n - 4, err
+	var n int
+	var callErr error
+	err = rc.Read(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &to[0], Len: uint64(len(to))},
+		}
+		n, callErr = tunReadv(int(fd), iovecs)
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+	if n < 4 {
+		return 0, nil
+	}
+	return n - 4, nil
 }
 
-// Write is only valid for single threaded use
+// Write pushes one IP packet onto the utun device. Safe for concurrent use:
+// the AF prefix and iovecs are per-call stack state, and the fd write itself
+// serializes on the runtime's fd mutex (see the Queue contract in tio.go).
 func (t *tun) Write(from []byte) (int, error) {
-	buf := t.out
-	if cap(buf) < len(from)+4 {
-		buf = make([]byte, len(from)+4)
-		t.out = buf
-	}
-	buf = buf[:len(from)+4]
-
 	if len(from) == 0 {
 		return 0, syscall.EIO
 	}
 
-	// Determine the IP Family for the NULL L2 Header
 	ipVer := from[0] >> 4
-	if ipVer == 4 {
-		buf[3] = syscall.AF_INET
-	} else if ipVer == 6 {
-		buf[3] = syscall.AF_INET6
-	} else {
+	var head [4]byte
+	switch ipVer {
+	case 4:
+		head[3] = syscall.AF_INET
+	case 6:
+		head[3] = syscall.AF_INET6
+	default:
 		return 0, fmt.Errorf("unable to determine IP version from packet")
 	}
 
-	copy(buf[4:], from)
+	// Grab rc as a local so the compiler can devirtualize the call and keep the closure on the stack.
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
 
-	n, err := t.ReadWriteCloser.Write(buf)
-	return n - 4, err
+	var n int
+	var callErr error
+	err = rc.Write(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &from[0], Len: uint64(len(from))},
+		}
+		n, callErr = tunWritev(int(fd), iovecs)
+		// Type-assert to syscall.Errno so the EAGAIN/EWOULDBLOCK/EINTR check doesn't box the errno
+		// constants into error interfaces on every call.
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+
+	return n - 4, nil
 }
 
 func (t *tun) Networks() []netip.Prefix {
@@ -549,10 +665,6 @@ func (t *tun) Name() string {
 	return t.Device
 }
 
-func (t *tun) SupportsMultiqueue() bool {
-	return false
-}
-
-func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("TODO: multiqueue not implemented for darwin")
+func (t *tun) Queues(int) ([]tio.Queue, error) {
+	return []tio.Queue{tio.NewSingleQueue(t, defaultBatchBufSize)}, nil
 }

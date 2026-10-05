@@ -1,11 +1,14 @@
 package nebula
 
 import (
-	"context"
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gaissmai/bart"
 	"github.com/slackhq/nebula/cert"
@@ -28,40 +31,47 @@ func TestOldIPv4Only(t *testing.T) {
 	assert.Equal(t, binary.BigEndian.Uint32(bp[:]), m.GetAddr())
 }
 
+func testCertState(networks ...netip.Prefix) *CertState {
+	cs := &CertState{
+		myVpnNetworks:      networks,
+		myVpnNetworksTable: new(bart.Lite),
+		myVpnAddrs:         make([]netip.Addr, 0, len(networks)),
+		myVpnAddrsTable:    new(bart.Lite),
+	}
+
+	for _, n := range networks {
+		cs.myVpnNetworksTable.Insert(n)
+		cs.myVpnAddrs = append(cs.myVpnAddrs, n.Addr())
+		cs.myVpnAddrsTable.Insert(netip.PrefixFrom(n.Addr(), n.Addr().BitLen()))
+	}
+
+	return cs
+}
+
 func Test_lhStaticMapping(t *testing.T) {
 	l := test.NewLogger()
 	myVpnNet := netip.MustParsePrefix("10.128.0.1/16")
-	nt := new(bart.Lite)
-	nt.Insert(myVpnNet)
-	cs := &CertState{
-		myVpnNetworks:      []netip.Prefix{myVpnNet},
-		myVpnNetworksTable: nt,
-	}
+	cs := testCertState(myVpnNet)
 	lh1 := "10.128.0.2"
 
 	c := config.NewC(l)
 	c.Settings["lighthouse"] = map[string]any{"hosts": []any{lh1}}
 	c.Settings["static_host_map"] = map[string]any{lh1: []any{"1.1.1.1:4242"}}
-	_, err := NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	_, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
 	require.NoError(t, err)
 
 	lh2 := "10.128.0.3"
 	c = config.NewC(l)
 	c.Settings["lighthouse"] = map[string]any{"hosts": []any{lh1, lh2}}
 	c.Settings["static_host_map"] = map[string]any{lh1: []any{"100.1.1.1:4242"}}
-	_, err = NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	_, err = NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
 	require.EqualError(t, err, "lighthouse 10.128.0.3 does not have a static_host_map entry")
 }
 
 func TestReloadLighthouseInterval(t *testing.T) {
 	l := test.NewLogger()
 	myVpnNet := netip.MustParsePrefix("10.128.0.1/16")
-	nt := new(bart.Lite)
-	nt.Insert(myVpnNet)
-	cs := &CertState{
-		myVpnNetworks:      []netip.Prefix{myVpnNet},
-		myVpnNetworksTable: nt,
-	}
+	cs := testCertState(myVpnNet)
 	lh1 := "10.128.0.2"
 
 	c := config.NewC(l)
@@ -71,7 +81,7 @@ func TestReloadLighthouseInterval(t *testing.T) {
 	}
 
 	c.Settings["static_host_map"] = map[string]any{lh1: []any{"1.1.1.1:4242"}}
-	lh, err := NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
 	require.NoError(t, err)
 	lh.ifce = &mockEncWriter{}
 
@@ -91,15 +101,10 @@ func TestReloadLighthouseInterval(t *testing.T) {
 func BenchmarkLighthouseHandleRequest(b *testing.B) {
 	l := test.NewLogger()
 	myVpnNet := netip.MustParsePrefix("10.128.0.1/0")
-	nt := new(bart.Lite)
-	nt.Insert(myVpnNet)
-	cs := &CertState{
-		myVpnNetworks:      []netip.Prefix{myVpnNet},
-		myVpnNetworksTable: nt,
-	}
+	cs := testCertState(myVpnNet)
 
 	c := config.NewC(l)
-	lh, err := NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	lh, err := NewLightHouseFromConfig(b.Context(), l, c, cs, nil, nil)
 	require.NoError(b, err)
 
 	hAddr := netip.MustParseAddrPort("4.5.6.7:12345")
@@ -196,13 +201,8 @@ func TestLighthouse_Memory(t *testing.T) {
 	c.Settings["listen"] = map[string]any{"port": 4242}
 
 	myVpnNet := netip.MustParsePrefix("10.128.0.1/24")
-	nt := new(bart.Lite)
-	nt.Insert(myVpnNet)
-	cs := &CertState{
-		myVpnNetworks:      []netip.Prefix{myVpnNet},
-		myVpnNetworksTable: nt,
-	}
-	lh, err := NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	cs := testCertState(myVpnNet)
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
 	lh.ifce = &mockEncWriter{}
 	require.NoError(t, err)
 	lhh := lh.NewRequestHandler()
@@ -281,14 +281,9 @@ func TestLighthouse_reload(t *testing.T) {
 	c.Settings["listen"] = map[string]any{"port": 4242}
 
 	myVpnNet := netip.MustParsePrefix("10.128.0.1/24")
-	nt := new(bart.Lite)
-	nt.Insert(myVpnNet)
-	cs := &CertState{
-		myVpnNetworks:      []netip.Prefix{myVpnNet},
-		myVpnNetworksTable: nt,
-	}
+	cs := testCertState(myVpnNet)
 
-	lh, err := NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
 	require.NoError(t, err)
 
 	nc := map[string]any{
@@ -304,7 +299,130 @@ func TestLighthouse_reload(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func newLHHostRequest(fromAddr netip.AddrPort, myVpnIp, queryVpnIp netip.Addr, lhh *LightHouseHandler) testLhReply {
+// TestLighthouse_reloadStaticHostMap verifies that reloading static_host_map applies the new
+// config rather than appending to it. See issue #718.
+func TestLighthouse_reloadStaticHostMap(t *testing.T) {
+	l := test.NewLogger()
+	c := config.NewC(l)
+	c.Settings["lighthouse"] = map[string]any{"am_lighthouse": true}
+	c.Settings["listen"] = map[string]any{"port": 4242}
+	c.Settings["static_host_map"] = map[string]any{
+		"10.128.0.2": []any{"1.1.1.1:4242"},
+	}
+
+	myVpnNet := netip.MustParsePrefix("10.128.0.1/24")
+	cs := testCertState(myVpnNet)
+
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
+	require.NoError(t, err)
+
+	staticHost := netip.MustParseAddr("10.128.0.2")
+	otherHost := netip.MustParseAddr("10.128.0.3")
+
+	// Capture the RemoteList pointer up front; an in-flight handshake would hold the same one
+	// on hostinfo.remotes, so it must reflect every reload below.
+	pinned := lh.Query(staticHost)
+	require.NotNil(t, pinned)
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:4242")}, pinned.CopyAddrs([]netip.Prefix{}))
+
+	// Replace the remote address. The new address should be the only entry.
+	nc := map[string]any{
+		"static_host_map": map[string]any{
+			"10.128.0.2": []any{"2.2.2.2:4242"},
+		},
+	}
+	rc, err := yaml.Marshal(nc)
+	require.NoError(t, err)
+	require.NoError(t, c.ReloadConfigString(string(rc)))
+
+	rl := lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Same(t, pinned, rl, "RemoteList pointer must stay stable so in-flight handshakes pick up the change")
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("2.2.2.2:4242")}, rl.CopyAddrs([]netip.Prefix{}))
+
+	// Reload back to the original IP. Mirrors the round-trip in issue #718 step 6-8 where
+	// the buggy reload produced [1.1.1.1, 2.2.2.2, 1.1.1.1] instead of [1.1.1.1].
+	nc = map[string]any{
+		"static_host_map": map[string]any{
+			"10.128.0.2": []any{"1.1.1.1:4242"},
+		},
+	}
+	rc, err = yaml.Marshal(nc)
+	require.NoError(t, err)
+	require.NoError(t, c.ReloadConfigString(string(rc)))
+
+	rl = lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Same(t, pinned, rl)
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:4242")}, rl.CopyAddrs([]netip.Prefix{}))
+
+	// Reload with the same config. An unchanged entry must not duplicate.
+	require.NoError(t, c.ReloadConfigString(string(rc)))
+
+	rl = lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Same(t, pinned, rl)
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:4242")}, rl.CopyAddrs([]netip.Prefix{}))
+
+	// Switch back to 2.2.2.2 so the rest of the test continues against a known address.
+	nc = map[string]any{
+		"static_host_map": map[string]any{
+			"10.128.0.2": []any{"2.2.2.2:4242"},
+		},
+	}
+	rc, err = yaml.Marshal(nc)
+	require.NoError(t, err)
+	require.NoError(t, c.ReloadConfigString(string(rc)))
+
+	// Add a second host alongside the first. Both should be present, neither duplicated.
+	nc = map[string]any{
+		"static_host_map": map[string]any{
+			"10.128.0.2": []any{"2.2.2.2:4242"},
+			"10.128.0.3": []any{"3.3.3.3:4242"},
+		},
+	}
+	rc, err = yaml.Marshal(nc)
+	require.NoError(t, err)
+	require.NoError(t, c.ReloadConfigString(string(rc)))
+
+	rl = lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Same(t, pinned, rl, "adding a sibling entry must not displace the existing RemoteList")
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("2.2.2.2:4242")}, rl.CopyAddrs([]netip.Prefix{}))
+
+	rl = lh.Query(otherHost)
+	require.NotNil(t, rl)
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("3.3.3.3:4242")}, rl.CopyAddrs([]netip.Prefix{}))
+
+	// Drop the first host entirely. The vpnAddr is no longer marked static, our owner
+	// contribution is cleared, but the addrMap entry stays in place so non-static cache
+	// data (from lighthouse queries) on the same RemoteList isn't lost. In-flight handshakes
+	// that already had the pointer see an empty address list rather than retrying stale ones.
+	nc = map[string]any{
+		"static_host_map": map[string]any{
+			"10.128.0.3": []any{"3.3.3.3:4242"},
+		},
+	}
+	rc, err = yaml.Marshal(nc)
+	require.NoError(t, err)
+	require.NoError(t, c.ReloadConfigString(string(rc)))
+
+	_, isStatic := lh.GetStaticHostList()[staticHost]
+	assert.False(t, isStatic)
+
+	rl = lh.Query(staticHost)
+	require.NotNil(t, rl)
+	assert.Same(t, pinned, rl)
+	assert.Empty(t, rl.CopyAddrs([]netip.Prefix{}))
+
+	rl = lh.Query(otherHost)
+	require.NotNil(t, rl)
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("3.3.3.3:4242")}, rl.CopyAddrs([]netip.Prefix{}))
+}
+
+// sendLHHostRequest delivers a HostQuery to lhh and hands back the writer that
+// captured what it emitted. Pass a nil filter to see every message.
+func sendLHHostRequest(fromAddr netip.AddrPort, myVpnIp, queryVpnIp netip.Addr, lhh *LightHouseHandler, filter *NebulaMeta_MessageType) *testEncWriter {
 	req := &NebulaMeta{
 		Type:    NebulaMeta_HostQuery,
 		Details: &NebulaMetaDetails{},
@@ -322,12 +440,59 @@ func newLHHostRequest(fromAddr netip.AddrPort, myVpnIp, queryVpnIp netip.Addr, l
 		panic(err)
 	}
 
-	filter := NebulaMeta_HostQueryReply
-	w := &testEncWriter{
-		metaFilter: &filter,
-	}
+	w := &testEncWriter{metaFilter: filter}
 	lhh.HandleRequest(fromAddr, []netip.Addr{myVpnIp}, b, w)
-	return w.lastReply
+	return w
+}
+
+func newLHHostRequest(fromAddr netip.AddrPort, myVpnIp, queryVpnIp netip.Addr, lhh *LightHouseHandler) testLhReply {
+	filter := NebulaMeta_HostQueryReply
+	return sendLHHostRequest(fromAddr, myVpnIp, queryVpnIp, lhh, &filter).lastReply
+}
+
+func TestLighthouse_IgnoresHostQueryForItself(t *testing.T) {
+	// Validate that we don't answer host queries for our own address.
+	l := test.NewLogger()
+
+	myVpnNet := netip.MustParsePrefix("10.128.0.1/24")
+	myVpnIp := myVpnNet.Addr()
+
+	c := config.NewC(l)
+	c.Settings["lighthouse"] = map[string]any{"am_lighthouse": true}
+	c.Settings["listen"] = map[string]any{"port": 4242}
+	// Add a static_host_map entry for ourselves, so our address
+	// is in the addrMap.
+	c.Settings["static_host_map"] = map[string]any{
+		myVpnIp.String(): []any{"192.168.100.1:4242"},
+	}
+
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, testCertState(myVpnNet), nil, nil)
+	require.NoError(t, err)
+	lh.ifce = &mockEncWriter{}
+	lhh := lh.NewRequestHandler()
+
+	peerVpnIp := netip.MustParseAddr("10.128.0.2")
+	peerUdpAddr := netip.MustParseAddrPort("10.0.0.2:4242")
+	otherVpnIp := netip.MustParseAddr("10.128.0.3")
+	otherUdpAddr := netip.MustParseAddrPort("10.0.0.3:4242")
+
+	newLHHostUpdate(peerUdpAddr, peerVpnIp, []netip.AddrPort{peerUdpAddr}, lhh)
+	newLHHostUpdate(otherUdpAddr, otherVpnIp, []netip.AddrPort{otherUdpAddr}, lhh)
+
+	// Control: a query about a real peer is still answered, and still ends with
+	// the punch notification aimed at the host that was asked about.
+	w := sendLHHostRequest(peerUdpAddr, peerVpnIp, otherVpnIp, lhh, nil)
+	require.NotNil(t, w.lastReply.msg)
+	assert.Equal(t, NebulaMeta_HostPunchNotification, w.lastReply.msg.Type)
+	assert.Equal(t, otherVpnIp, w.lastReply.vpnIp)
+
+	// Now validate that we don't send to ourselves.
+	found, _, err := lh.queryAndPrepMessage(myVpnIp, func(*cache) (int, error) { return 0, nil })
+	require.NoError(t, err)
+	require.True(t, found, "the lighthouse should hold a cache entry for its own address")
+
+	w = sendLHHostRequest(peerUdpAddr, peerVpnIp, myVpnIp, lhh, nil)
+	assert.Nil(t, w.lastReply.msg, "a query about our own address must produce no reply and no punch notification")
 }
 
 func newLHHostUpdate(fromAddr netip.AddrPort, vpnIp netip.Addr, addrs []netip.AddrPort, lhh *LightHouseHandler) {
@@ -373,7 +538,7 @@ type testEncWriter struct {
 	protocolVersion cert.Version
 }
 
-func (tw *testEncWriter) SendVia(via *HostInfo, relay *Relay, ad, nb, out []byte, nocopy bool) {
+func (tw *testEncWriter) SendVia(via *HostInfo, relay *Relay, ad, nb, out []byte, nocopy bool, q int) {
 }
 func (tw *testEncWriter) Handshake(vpnIp netip.Addr) {
 }
@@ -517,13 +682,8 @@ func TestLighthouse_Dont_Delete_Static_Hosts(t *testing.T) {
 	}
 
 	myVpnNet := netip.MustParsePrefix("10.128.0.1/24")
-	nt := new(bart.Lite)
-	nt.Insert(myVpnNet)
-	cs := &CertState{
-		myVpnNetworks:      []netip.Prefix{myVpnNet},
-		myVpnNetworksTable: nt,
-	}
-	lh, err := NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	cs := testCertState(myVpnNet)
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
 	require.NoError(t, err)
 	lh.ifce = &mockEncWriter{}
 
@@ -583,13 +743,8 @@ func TestLighthouse_DeletesWork(t *testing.T) {
 	}
 
 	myVpnNet := netip.MustParsePrefix("10.128.0.1/24")
-	nt := new(bart.Lite)
-	nt.Insert(myVpnNet)
-	cs := &CertState{
-		myVpnNetworks:      []netip.Prefix{myVpnNet},
-		myVpnNetworksTable: nt,
-	}
-	lh, err := NewLightHouseFromConfig(context.Background(), l, c, cs, nil, nil)
+	cs := testCertState(myVpnNet)
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
 	require.NoError(t, err)
 	lh.ifce = &mockEncWriter{}
 
@@ -612,4 +767,85 @@ func TestLighthouse_DeletesWork(t *testing.T) {
 	//verify
 	out = lh.Query(testHost)
 	assert.Nil(t, out)
+}
+
+func TestLightHouse_logLocalAddrsErr(t *testing.T) {
+	out := &bytes.Buffer{}
+	lh := &LightHouse{l: test.NewLoggerWithOutput(out)}
+
+	// The first sighting of a failure warns.
+	lh.logLocalAddrsErr(errors.New("permission denied"))
+	assert.Contains(t, out.String(), "level=WARN")
+	assert.Contains(t, out.String(), "permission denied")
+
+	// Repeating unchanged does not warn again, which is what keeps a permanent failure from warning
+	// on every lighthouse.interval for the life of the process.
+	out.Reset()
+	lh.logLocalAddrsErr(errors.New("permission denied"))
+	assert.NotContains(t, out.String(), "level=WARN")
+
+	// A different failure is a new event and warns.
+	out.Reset()
+	lh.logLocalAddrsErr(errors.New("something else"))
+	assert.Contains(t, out.String(), "level=WARN")
+	assert.Contains(t, out.String(), "something else")
+
+	// Recovering resets, so the same failure returning later warns again.
+	out.Reset()
+	lh.logLocalAddrsErr(nil)
+	assert.Empty(t, out.String())
+	lh.logLocalAddrsErr(errors.New("something else"))
+	assert.Contains(t, out.String(), "level=WARN")
+}
+
+// heldEncWriter holds the query worker in its first GetHostInfo until release closes.
+type heldEncWriter struct {
+	mockEncWriter
+	once    sync.Once
+	held    chan struct{}
+	release chan struct{}
+}
+
+func (w *heldEncWriter) GetHostInfo(netip.Addr) *HostInfo {
+	w.once.Do(func() { close(w.held) })
+	<-w.release
+	return nil
+}
+
+// QueryServer never waits on the query worker, since the packet readers call it and nothing drains the channel at
+// shutdown; a query that finds the channel full is dropped and counted. The worker is held on its first query so the
+// channel fills.
+func TestLighthouse_QueryServerDoesNotBlock(t *testing.T) {
+	l := test.NewLogger()
+	cs := testCertState(netip.MustParsePrefix("10.128.0.1/16"))
+	lh1 := "10.128.0.2"
+	c := config.NewC(l)
+	c.Settings["lighthouse"] = map[string]any{"hosts": []any{lh1}}
+	c.Settings["static_host_map"] = map[string]any{lh1: []any{"1.1.1.1:4242"}}
+	c.Settings["handshakes"] = map[string]any{"query_buffer": 1}
+	lh, err := NewLightHouseFromConfig(t.Context(), l, c, cs, nil, nil)
+	require.NoError(t, err)
+	w := &heldEncWriter{held: make(chan struct{}), release: make(chan struct{})}
+	lh.ifce = w
+	t.Cleanup(func() { close(w.release) })
+
+	lh.QueryServer(netip.MustParseAddr("10.128.0.10"))
+	select {
+	case <-w.held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the query worker never took the first query")
+	}
+	dropped := lh.queryDropped.Count()
+	done := make(chan struct{})
+	go func() {
+		lh.QueryServer(netip.MustParseAddr("10.128.0.11"))
+		lh.QueryServer(netip.MustParseAddr("10.128.0.12"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("QueryServer blocked on a full query channel")
+	}
+	assert.EqualValues(t, 1, lh.queryDropped.Count()-dropped)
 }

@@ -1,5 +1,4 @@
 //go:build !e2e_testing
-// +build !e2e_testing
 
 package udp
 
@@ -8,12 +7,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"syscall"
 	"unsafe"
 
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
 	"golang.org/x/sys/unix"
 )
@@ -22,14 +21,14 @@ type StdConn struct {
 	*net.UDPConn
 	isV4  bool
 	sysFd uintptr
-	l     *logrus.Logger
+	l     *slog.Logger
 }
 
 var _ Conn = &StdConn{}
 
-func NewListener(l *logrus.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
-	lc := NewListenConfig(multi)
-	pc, err := lc.ListenPacket(context.TODO(), "udp", net.JoinHostPort(ip.String(), fmt.Sprintf("%v", port)))
+func NewListener(l *slog.Logger, s Settings) (Conn, error) {
+	lc := NewListenConfig(s.Multi)
+	pc, err := lc.ListenPacket(context.TODO(), "udp", s.Listen.String())
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +139,22 @@ func (u *StdConn) WriteTo(b []byte, ap netip.AddrPort) error {
 	}
 }
 
+func (u *StdConn) WriteBatch(bufs [][]byte, addrs []netip.AddrPort) (int, error) {
+	// An un-sendable destination costs its own packet, never the ones behind it in the batch.
+	// TODO: WriteTo maps EWOULDBLOCK to an error, so a full send buffer
+	// silently drops the rest of a burst (linux blocks instead). Poll for
+	// writability on EAGAIN before giving up on the remainder.
+	written := 0
+	for i, b := range bufs {
+		if err := u.WriteTo(b, addrs[i]); err == nil {
+			written++
+		} else {
+			u.l.Debug("failed to write packet in batch", "udpAddr", addrs[i], "error", err)
+		}
+	}
+	return written, nil
+}
+
 func (u *StdConn) LocalAddr() (netip.AddrPort, error) {
 	a := u.UDPConn.LocalAddr()
 
@@ -165,7 +180,7 @@ func NewUDPStatsEmitter(udpConns []Conn) func() {
 	return func() {}
 }
 
-func (u *StdConn) ListenOut(r EncReader) {
+func (u *StdConn) ListenOut(r EncReader, flush func()) error {
 	buffer := make([]byte, MTU)
 
 	for {
@@ -173,14 +188,14 @@ func (u *StdConn) ListenOut(r EncReader) {
 		n, rua, err := u.ReadFromUDPAddrPort(buffer)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
-				return
+				return err
 			}
-
-			u.l.WithError(err).Error("unexpected udp socket receive error")
+			u.l.Error("unexpected udp socket receive error", "error", err)
+			continue
 		}
 
-		r(netip.AddrPortFrom(rua.Addr().Unmap(), rua.Port()), buffer[:n])
+		r(netip.AddrPortFrom(rua.Addr().Unmap(), rua.Port()), buffer[:n:n])
+		flush()
 	}
 }
 
@@ -188,6 +203,9 @@ func (u *StdConn) SupportsMultipleReaders() bool {
 	return false
 }
 
+// Rebind clears the interface the kernel scoped this socket to, so that sends are routed against the current
+// routing table instead of the interface we happened to be on when the socket was created. Darwin pins sockets
+// this way on its own, which is what strands us after the underlying network changes.
 func (u *StdConn) Rebind() error {
 	var err error
 	if u.isV4 {
@@ -196,9 +214,5 @@ func (u *StdConn) Rebind() error {
 		err = syscall.SetsockoptInt(int(u.sysFd), syscall.IPPROTO_IPV6, syscall.IPV6_BOUND_IF, 0)
 	}
 
-	if err != nil {
-		u.l.WithError(err).Error("Failed to rebind udp socket")
-	}
-
-	return nil
+	return err
 }

@@ -1,12 +1,11 @@
 //go:build !e2e_testing
-// +build !e2e_testing
 
 package overlay
 
 import (
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"net/netip"
 	"os"
 	"regexp"
@@ -15,8 +14,8 @@ import (
 	"unsafe"
 
 	"github.com/gaissmai/bart"
-	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/overlay/tio"
 	"github.com/slackhq/nebula/routing"
 	"github.com/slackhq/nebula/util"
 	netroute "golang.org/x/net/route"
@@ -54,20 +53,18 @@ type tun struct {
 	MTU         int
 	Routes      atomic.Pointer[[]Route]
 	routeTree   atomic.Pointer[bart.Table[routing.Gateways]]
-	l           *logrus.Logger
+	l           *slog.Logger
 	f           *os.File
 	fd          int
-	// cache out buffer since we need to prepend 4 bytes for tun metadata
-	out []byte
 }
 
 var deviceNameRE = regexp.MustCompile(`^tun[0-9]+$`)
 
-func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ []netip.Prefix) (*tun, error) {
+func newTunFromFd(_ *config.C, _ *slog.Logger, _ int, _ []netip.Prefix) (*tun, error) {
 	return nil, fmt.Errorf("newTunFromFd not supported in openbsd")
 }
 
-func newTun(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, _ bool) (*tun, error) {
+func newTun(c *config.C, l *slog.Logger, vpnNetworks []netip.Prefix, _ bool) (*tun, error) {
 	// Try to open tun device
 	var err error
 	deviceName := c.GetString("tun.dev", "")
@@ -85,7 +82,7 @@ func newTun(c *config.C, l *logrus.Logger, vpnNetworks []netip.Prefix, _ bool) (
 
 	err = unix.SetNonblock(fd, true)
 	if err != nil {
-		l.WithError(err).Warn("Failed to set the tun device as nonblocking")
+		l.Warn("Failed to set the tun device as nonblocking", "error", err)
 	}
 
 	t := &tun{
@@ -124,42 +121,103 @@ func (t *tun) Close() error {
 	return nil
 }
 
+// tunWritev and tunReadv are linkname'd to x/sys/unix's libc-routed writev/readv stubs so the
+// calls go through libc's pinned trampoline. OpenBSD's pinsyscall protection rejects a raw
+// syscall.Syscall(SYS_WRITEV/SYS_READV, ...) because it doesn't originate from a libc-pinned
+// address, so we can't use the syscall.Syscall pattern that freebsd / netbsd use. We pull the
+// low-level stubs instead of calling unix.Writev/unix.Readv because those take [][]byte and rebuild
+// the []Iovec every call, which heap-allocates the header; linkname'ing the stubs lets us hand them
+// our own stack-allocated iovecs. See golang/go#78049.
+
+//go:linkname tunWritev golang.org/x/sys/unix.writev
+//go:noescape
+func tunWritev(fd int, iovecs []unix.Iovec) (n int, err error)
+
+//go:linkname tunReadv golang.org/x/sys/unix.readv
+//go:noescape
+func tunReadv(fd int, iovecs []unix.Iovec) (n int, err error)
+
+// Read pulls one IP packet off the tun device, scattering the 4 byte protocol header away from
+// the packet so the payload lands directly in to.
 func (t *tun) Read(to []byte) (int, error) {
-	buf := make([]byte, len(to)+4)
+	var head [4]byte
 
-	n, err := t.f.Read(buf)
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
 
-	copy(to, buf[4:])
-	return n - 4, err
+	var n int
+	var callErr error
+	err = rc.Read(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &to[0], Len: uint64(len(to))},
+		}
+		n, callErr = tunReadv(int(fd), iovecs)
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+	if n < 4 {
+		return 0, nil
+	}
+	return n - 4, nil
 }
 
-// Write is only valid for single threaded use
+// Write pushes one IP packet onto the tun device.
 func (t *tun) Write(from []byte) (int, error) {
-	buf := t.out
-	if cap(buf) < len(from)+4 {
-		buf = make([]byte, len(from)+4)
-		t.out = buf
-	}
-	buf = buf[:len(from)+4]
-
 	if len(from) == 0 {
 		return 0, syscall.EIO
 	}
 
-	// Determine the IP Family for the NULL L2 Header
 	ipVer := from[0] >> 4
-	if ipVer == 4 {
-		buf[3] = syscall.AF_INET
-	} else if ipVer == 6 {
-		buf[3] = syscall.AF_INET6
-	} else {
+	var head [4]byte
+	switch ipVer {
+	case 4:
+		head[3] = syscall.AF_INET
+	case 6:
+		head[3] = syscall.AF_INET6
+	default:
 		return 0, fmt.Errorf("unable to determine IP version from packet")
 	}
 
-	copy(buf[4:], from)
+	// Grab rc as a local so the compiler can devirtualize the call and keep the closure on the stack.
+	rc, err := t.f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
 
-	n, err := t.f.Write(buf)
-	return n - 4, err
+	var n int
+	var callErr error
+	err = rc.Write(func(fd uintptr) bool {
+		iovecs := []unix.Iovec{
+			{Base: &head[0], Len: 4},
+			{Base: &from[0], Len: uint64(len(from))},
+		}
+		n, callErr = tunWritev(int(fd), iovecs)
+		// Type-assert to syscall.Errno so the EAGAIN/EWOULDBLOCK/EINTR check doesn't box the errno
+		// constants into error interfaces on every call.
+		if errno, ok := callErr.(syscall.Errno); ok && errno.Temporary() {
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return 0, err
+	}
+	if callErr != nil {
+		return 0, callErr
+	}
+
+	return n - 4, nil
 }
 
 func (t *tun) addIp(cidr netip.Prefix) error {
@@ -310,12 +368,8 @@ func (t *tun) Name() string {
 	return t.Device
 }
 
-func (t *tun) SupportsMultiqueue() bool {
-	return false
-}
-
-func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
-	return nil, fmt.Errorf("TODO: multiqueue not implemented for openbsd")
+func (t *tun) Queues(int) ([]tio.Queue, error) {
+	return []tio.Queue{tio.NewSingleQueue(t, defaultBatchBufSize)}, nil
 }
 
 func (t *tun) addRoutes(logErrors bool) error {
@@ -336,7 +390,7 @@ func (t *tun) addRoutes(logErrors bool) error {
 				return retErr
 			}
 		} else {
-			t.l.WithField("route", r).Info("Added route")
+			t.l.Info("Added route", "route", r)
 		}
 	}
 
@@ -351,9 +405,9 @@ func (t *tun) removeRoutes(routes []Route) error {
 
 		err := delRoute(r.Cidr, t.vpnNetworks)
 		if err != nil {
-			t.l.WithError(err).WithField("route", r).Error("Failed to remove route")
+			t.l.Error("Failed to remove route", "error", err, "route", r)
 		} else {
-			t.l.WithField("route", r).Info("Removed route")
+			t.l.Info("Removed route", "route", r)
 		}
 	}
 	return nil

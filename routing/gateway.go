@@ -3,24 +3,25 @@ package routing
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 )
 
 const (
-	// Sentinal value
+	// Sentinel value
 	BucketNotCalculated = -1
 )
 
 type Gateways []Gateway
 
 func (g Gateways) String() string {
-	str := ""
+	var str strings.Builder
 	for i, gw := range g {
-		str += gw.String()
+		str.WriteString(gw.String())
 		if i < len(g)-1 {
-			str += ", "
+			str.WriteString(", ")
 		}
 	}
-	return str
+	return str.String()
 }
 
 type Gateway struct {
